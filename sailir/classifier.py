@@ -18,6 +18,7 @@ from earlier iterations; the architecture and parameter names are identical to
 IBPActionClassifierV5 so the published checkpoint loads without modification.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,6 +99,34 @@ class CoefficientEncoder(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
+        # FULL LOOKUP TABLE over the field, behind a zero-init gate.
+        #
+        # The features above are an integer intuition applied to a residue:
+        # "log magnitude" and "mod 100" mean little in GF(p), where p-1 is -1
+        # rather than a large number. Measured on the corrupt cull corpus,
+        # 43.4% of nonzero coefficients miss the |signed| <= 31 lookup and are
+        # described by those features, and rational reconstruction rescues only
+        # 56.8% of those occurrences -- so they are not a complete answer.
+        #
+        # forward() is a function of ONE discrete value in [0, prime), so any
+        # encoder of it is exactly representable by an Embedding(prime,
+        # embed_dim). That table is therefore the most expressive coefficient
+        # encoder that can exist here, and at prime=1009 it costs 129k params
+        # (+1.5% of the model) with NO change to activation width -- which
+        # matters because this runs at B*A*T ~ 129k terms per batch.
+        #
+        # Zero-init gate so a warm start from a checkpoint without the table is
+        # bit-identical at init; the table has to earn its way in, exactly as
+        # eq_gate does for the equation branch.
+        self.use_table = os.environ.get('SAILIR_COEFF_TABLE') == '1'
+        if self.use_table:
+            # prime is a REQUIRED kwarg and must never be defaulted: a default
+            # 2^31-1 against a trained 1009 silently flipped 8.2% of top-1
+            # predictions for two months.
+            self.coeff_table = nn.Embedding(prime, embed_dim)
+            nn.init.normal_(self.coeff_table.weight, std=0.02)
+            self.coeff_table_gate = nn.Parameter(torch.zeros(1))
+
     def forward(self, coeff):
         orig_shape = coeff.shape
         coeff_flat = coeff.reshape(-1).float()
@@ -118,7 +147,13 @@ class CoefficientEncoder(nn.Module):
         large_emb = self.large_embed(large_features)
 
         combined = torch.cat([small_emb, large_emb], dim=-1)
-        return self.combine(combined).reshape(*orig_shape, -1)
+        out = self.combine(combined)
+        if self.use_table:
+            # Residues are already in [0, prime); the modulo is a cheap guard
+            # against an out-of-range index becoming a silent CUDA assert.
+            idx = coeff.reshape(-1).long().remainder(self.prime)
+            out = out + self.coeff_table_gate * self.coeff_table(idx)
+        return out.reshape(*orig_shape, -1)
 
 
 class ActionEncoder(nn.Module):

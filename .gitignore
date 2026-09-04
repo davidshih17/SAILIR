@@ -69,3 +69,15 @@ scripts/symmetries/logs/
 *.tar.gz
 topology_input/fire_tables40_math_All.m
 topology_input/*/kira_*/
+
+# Refactor backups. .weightfix_*/pre_refactor.tgz alone is 15 GB -- 95% of
+# everything git would otherwise pick up here.
+.weightfix_*/
+*.bak_*
+
+# Model weights. NOT committed: training now starts FROM SCRATCH (no --resume
+# on init.pt), and every .pt is 50-60 MB. Checkpoints move out of band.
+*.pt
+
+# Job marker files
+.done_*

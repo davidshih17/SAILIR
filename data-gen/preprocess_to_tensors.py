@@ -45,6 +45,19 @@ def load_and_convert(input_paths, n_indices, max_samples=None):
     for input_path in input_paths:
         if max_samples and i_global >= max_samples:
             break
+        # EXP 1: the START target T of this trajectory. The model is given the
+        # per-step target (the current top of the bucket) but never T, yet the
+        # whole task is defined relative to T -- "active work" means at-or-above
+        # T in the total order, so T is the floor of the active region and two
+        # states with identical expressions but different T have different
+        # amounts of work left. T needs no re-recording: at step 0 the
+        # expression is {T: 1}, so the first line's target IS T.
+        # Scramble/replay files have no start target (they walk up from a
+        # master with no fixed T); there the per-line fallback below sets
+        # start_target = the line's own target, which keeps those samples in
+        # distribution rather than feeding an out-of-range sentinel.
+        start_target = None
+        _file_start = len(samples)      # EXP 2: where this trajectory begins
         with open(input_path) as f:
             for line in f:
                 if max_samples and i_global >= max_samples:
@@ -53,6 +66,8 @@ def load_and_convert(input_paths, n_indices, max_samples=None):
                 expr = s['expr']
                 subs = s['subs']
                 actions = s['valid_actions']
+                if start_target is None:
+                    start_target = s.get('start_target', s['target'])
 
                 samples.append({
                     # === METADATA ===
@@ -64,6 +79,7 @@ def load_and_convert(input_paths, n_indices, max_samples=None):
                     # === TARGET INFO ===
                     'target': torch.tensor(s['target'], dtype=torch.int8),
                     'target_weight': torch.tensor(s.get('target_weight', [0, 0])[:2], dtype=torch.int8),
+                    'start_target': torch.tensor(start_target, dtype=torch.int8),
 
                     # === EXPRESSION ===
                     'expr_integrals': torch.tensor([t[0] for t in expr], dtype=torch.int8),
@@ -82,17 +98,55 @@ def load_and_convert(input_paths, n_indices, max_samples=None):
                     'chosen_action_ibp_op': s['chosen_action'][0] if 'chosen_action' in s else (actions[s['chosen_action_idx']][0] if actions else 0),
                     'chosen_action_delta': torch.tensor(s['chosen_action'][1] if 'chosen_action' in s else (actions[s['chosen_action_idx']][1] if actions else [0] * n_indices), dtype=torch.int8),
                     'label': s['chosen_action_idx'],
+
+                    # EVERY unused closure row that solves this target, as
+                    # indices into valid_actions. All of them are correct
+                    # actions, so 'label' above is one arbitrary pick from this
+                    # set. Carried through so (a) a different label rule can be
+                    # applied offline without re-recording and (b) a model can
+                    # be scored on "did top-1 hit ANY reducing action" instead
+                    # of conformity to one convention. Empty list for the older
+                    # dots_sweep_* recordings, which predate the field. Cheap:
+                    # median 10 ints/step against ~9700 valid actions.
+                    'valid_label_idxs': s.get('valid_label_idxs', []),
                 })
 
                 i_global += 1
                 if i_global % 100000 == 0:
                     print(f"  Loaded {i_global} samples (file {Path(input_path).name})...", flush=True)
 
+        # EXP 2: steps remaining until this trajectory closes, INCLUDING the
+        # current step, so the final step is 1 (never 0 -> log1p stays sane).
+        # Only known once the whole file is read, hence the back-fill. This is
+        # the cost-to-go label the beam search has no signal for; it needs no
+        # re-recording, it is just the trajectory length minus the step index.
+        _n = len(samples) - _file_start
+        for _j in range(_file_start, len(samples)):
+            samples[_j]['steps_remaining'] = _n - (_j - _file_start)
+
     return samples
 
 
-def pack_samples(samples):
-    """Pack variable-length samples into flat arrays with offsets. KEEPS ALL FIELDS."""
+def pack_samples(samples, include_subs=True):
+    """Pack variable-length samples into flat arrays with offsets.
+
+    include_subs=False DROPS the substitution fields (sub_integrals,
+    sub_offsets, subs_raw) entirely. They exist only for the original
+    `IBPActionClassifier`, whose FullSubstitutionEncoder consumed them; the
+    `nosubs` variant -- now the only model in use -- opens its forward() with
+      del sub_keys, sub_repl_ints, sub_repl_coeffs, sub_repl_mask, sub_mask
+    so every one of those tensors is built, read off disk, unpickled, collated,
+    pinned, shipped to the GPU, and thrown away untouched.
+
+    Measured on a real shard: subs_raw alone is 195 MB of 448 MB (43.6%), and
+    all sub_* fields together are 44.6% of the packed bytes. That was a
+    one-time startup cost under --data_dir, but the sharded loader re-reads and
+    re-unpickles every shard EVERY EPOCH, so it became a recurring tax on the
+    slowest part of the loop.
+
+    Corpora packed with include_subs=False are usable ONLY by nosubs models.
+    Recordings are kept, so a full-model corpus can always be repacked.
+    """
 
     # Collect all data
     all_scramble_ids = []
@@ -102,6 +156,8 @@ def pack_samples(samples):
 
     all_targets = []
     all_target_weights = []
+    all_start_targets = []          # EXP 1
+    all_steps_remaining = []        # EXP 2
 
     all_expr_integrals = []
     all_expr_coeffs = []
@@ -120,6 +176,13 @@ def pack_samples(samples):
     all_chosen_action_deltas = []
     all_labels = []
 
+    # MULTI-LABEL: every correct action per sample, flat + offsets (same layout
+    # as expr/actions). Needed because 'labels' above is ONE arbitrary pick out
+    # of ~18 equally correct actions, so hard cross-entropy penalises the model
+    # for choosing any of the other ~17.
+    all_valid_label_idxs = []
+    valid_label_offsets = [0]
+
     for s in samples:
         # Metadata
         all_scramble_ids.append(s['scramble_id'])
@@ -130,6 +193,13 @@ def pack_samples(samples):
         # Target
         all_targets.append(s['target'])
         all_target_weights.append(s['target_weight'])
+        # EXP 1: fall back to the per-step target for any sample packed
+        # before start_target existed, so old caches stay loadable.
+        all_start_targets.append(s.get('start_target', s['target']))
+        # 0 marks "no trajectory length known" (e.g. replay/scramble samples
+        # packed from elsewhere); the trainer MASKS those out of the value loss
+        # rather than training on a fabricated target.
+        all_steps_remaining.append(s.get('steps_remaining', 0))
 
         # Expression
         all_expr_integrals.append(s['expr_integrals'])
@@ -152,6 +222,14 @@ def pack_samples(samples):
         all_chosen_action_deltas.append(s['chosen_action_delta'])
         all_labels.append(s['label'])
 
+        # Fall back to the single label when a sample predates the field (the
+        # old dots_sweep_* recordings), so a mixed corpus still packs and the
+        # set loss degrades to ordinary cross-entropy on those rows rather
+        # than seeing an empty candidate set and producing -log(0).
+        _vl = s.get('valid_label_idxs') or [s['label']]
+        all_valid_label_idxs.extend(int(x) for x in _vl)
+        valid_label_offsets.append(valid_label_offsets[-1] + len(_vl))
+
     return {
         # === METADATA ===
         'scramble_ids': torch.tensor(all_scramble_ids, dtype=torch.int32),
@@ -162,16 +240,20 @@ def pack_samples(samples):
         # === TARGET INFO ===
         'target_integrals': torch.stack(all_targets),
         'target_weights': torch.stack(all_target_weights),
+        'start_target_integrals': torch.stack(all_start_targets),   # EXP 1
+        'steps_remaining': torch.tensor(all_steps_remaining, dtype=torch.int32),  # EXP 2
 
         # === EXPRESSION ===
         'expr_integrals': torch.cat(all_expr_integrals) if all_expr_integrals else torch.zeros(0, 7, dtype=torch.int8),
         'expr_coeffs': torch.cat(all_expr_coeffs) if all_expr_coeffs else torch.zeros(0, dtype=torch.int16),
         'expr_offsets': torch.tensor(expr_offsets, dtype=torch.int32),
 
-        # === SUBSTITUTIONS ===
-        'sub_integrals': torch.cat(all_sub_integrals) if any(len(s) > 0 for s in all_sub_integrals) else torch.zeros(0, 7, dtype=torch.int8),
-        'sub_offsets': torch.tensor(sub_offsets, dtype=torch.int32),
-        'subs_raw': all_subs_raw,  # Full substitution expressions (list of lists)
+        # === SUBSTITUTIONS (omitted entirely when include_subs=False) ===
+        **({
+            'sub_integrals': torch.cat(all_sub_integrals) if any(len(s) > 0 for s in all_sub_integrals) else torch.zeros(0, 7, dtype=torch.int8),
+            'sub_offsets': torch.tensor(sub_offsets, dtype=torch.int32),
+            'subs_raw': all_subs_raw,  # Full substitution expressions (list of lists)
+        } if include_subs else {}),
 
         # === ACTIONS ===
         'action_ibp_ops': torch.cat(all_action_ibp_ops) if all_action_ibp_ops else torch.zeros(0, dtype=torch.int8),
@@ -179,12 +261,16 @@ def pack_samples(samples):
         # dim from the first non-empty delta tensor we saw, or 0 if all empty.
         'action_deltas': torch.cat(all_action_deltas) if all_action_deltas else torch.zeros(0, 0, dtype=torch.int8),
         'action_offsets': torch.tensor(action_offsets, dtype=torch.int32),
-        'num_valid_actions': torch.tensor(all_num_valid_actions, dtype=torch.int16),
+        'num_valid_actions': torch.tensor(all_num_valid_actions, dtype=torch.int32),
 
         # === LABEL ===
         'chosen_action_ibp_ops': torch.tensor(all_chosen_action_ibp_ops, dtype=torch.int8),
         'chosen_action_deltas': torch.stack(all_chosen_action_deltas),
-        'labels': torch.tensor(all_labels, dtype=torch.int16),
+        'labels': torch.tensor(all_labels, dtype=torch.int32),
+
+        # === MULTI-LABEL (all correct actions per sample) ===
+        'valid_label_idxs': torch.tensor(all_valid_label_idxs, dtype=torch.int32),
+        'valid_label_offsets': torch.tensor(valid_label_offsets, dtype=torch.int32),
     }
 
 

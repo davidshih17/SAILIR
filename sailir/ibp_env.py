@@ -255,22 +255,37 @@ def get_raw_equation(ibp_t, li_t, ibp_op, seed, min_w12=None):
     else:
         m0, m1 = min_w12            # v7: (r,s) threshold
         abs0 = None
+    cone = _RAW_STRIP_CONE
     for shift, coeff_str in template:
         w0 = 0
         w1 = 0
+        m = 0
         for i in range(N_INDICES):
             v = seed[i] + shift[i]
             if v > 0:
                 w0 += v
+                if i < N_DENOMINATORS:
+                    m |= 1 << i
             elif v < 0:
                 w1 -= v
+        if cone is not None and (m & ~cone):
+            # out-of-cone term (den bit beyond the start sector): NEVER strip —
+            # the subsector action filter must see it to reject the action
+            # (den-row backward applications; see _RAW_STRIP_CONE note above).
+            c = eval_coeff(coeff_str, seed)
+            if c != 0:
+                eq[tuple(seed[i] + shift[i] for i in range(N_INDICES))] = c
+            continue
         if w0 < m0 or (w0 == m0 and w1 < m1):
             continue
         if abs0 is not None and w0 == m0 and w1 == m1:
             # boundary: same (r,s) as the start -> total-ordering tie-break on
-            # |abs|. A term with a lexicographically LARGER |abs|-tuple is BELOW
-            # the start in the total ordering, so it is sub-weight -> strip.
-            if tuple(abs(seed[i] + shift[i]) for i in range(N_INDICES)) > abs0:
+            # the |abs| component. weight() now returns tuple(-|a_i|) (larger =
+            # higher, consistent with r and s), so `abs0` is NEGATED and the
+            # test is `<`: a SMALLER negated-|abs| tuple is BELOW the start and
+            # is sub-weight -> strip. Comparing a positive |abs| tuple against
+            # this negated threshold would strip nearly everything.
+            if tuple(-abs(seed[i] + shift[i]) for i in range(N_INDICES)) < abs0:
                 continue
         c = eval_coeff(coeff_str, seed)
         if c != 0:
@@ -729,7 +744,28 @@ def is_higher_sector(i):
 
 
 def weight(i):
-    return (sum(max(0, x) for x in i), -sum(min(0, x) for x in i), tuple(abs(x) for x in i))
+    """Total weight of an integral. LARGER = HIGHER = eliminated first.
+
+        (r, s, tuple(-|a_i|))
+        r = sum of positive indices (denominator powers / dots)
+        s = sum of |negative indices| (numerator powers)
+
+    All THREE components run the same way, so `max(expr, key=weight)` is the
+    highest integral and no call site needs a per-component sign fix.
+
+    It used to return (r, s, +|abs|), where r and s meant larger = higher but
+    |abs| meant SMALLER = higher -- a relative sign mismatch INSIDE the key.
+    Every ordering site therefore hand-wrote (-w[0], -w[1], w[2]) to repair it,
+    and any site that forgot was silently wrong: 2026-09-02 the same unscramble
+    corpus measured 45/55 rise-fall with the raw tuple vs 98/2 correctly.
+    The |abs| component is negated HERE, once, so the mismatch cannot recur.
+
+    NOTE: this deliberately does NOT match `tkey`, which is smaller = higher and
+    carries a senior sector-rank component. tkey is the beam's order; do not
+    build one from the other.
+    """
+    return (sum(x for x in i if x > 0), -sum(min(0, x) for x in i),
+            tuple(-abs(x) for x in i))
 
 
 # --- optional active-weight stripping of CACHED raw equations (v7 search) ---
@@ -742,6 +778,22 @@ def weight(i):
 # separately by replay, which calls get_raw_equation with the default min_w12=None
 # (full equation). Opt-in: None => no stripping (v6 baseline unchanged).
 _RAW_STRIP_W12 = None
+_RAW_STRIP_CONE = None   # start-sector den bitmask; when set, terms with den
+#                          bits OUTSIDE this cone are NEVER stripped, whatever
+#                          their weight. Rationale (gravity3L, 2026-07-22): the
+#                          algebraic den rows relate an integral to a partner in
+#                          a HIGHER sector at LOWER (r,s); stripping that partner
+#                          blinded the subsector action filter, letting workers
+#                          apply the relation backward and bank sector-RAISING
+#                          results (substitution cycles at the orchestrator).
+#                          Out-of-cone terms must stay visible so the filter
+#                          rejects the action (matching data-gen semantics).
+
+
+def set_raw_strip_cone(mask):
+    """Set the start-sector cone (int den-bitmask) protected from stripping."""
+    global _RAW_STRIP_CONE
+    _RAW_STRIP_CONE = mask
 
 
 def set_raw_strip_threshold(w12):
@@ -767,8 +819,8 @@ def get_target(expr):
     non_masters = {k: v for k, v in top_only.items() if not is_master(k)}
     if not non_masters:
         return None
-    return max(non_masters.keys(),
-               key=lambda x: (weight(x)[0], weight(x)[1], [-a for a in weight(x)[2]]))
+    # weight() is larger = higher on ALL components now, so this is just max.
+    return max(non_masters.keys(), key=weight)
 
 
 def is_subsector(integral, target):

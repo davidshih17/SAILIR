@@ -145,8 +145,26 @@ class ShardedIBPDataset(IterableDataset):
         seed: int = 0,
         rank: int = 0,
         world_size: int = 1,
+        token_budget: int = 0,
+        max_batch: int = 0,
+        sort_window: int = 2048,
     ):
         super().__init__()
+        # TOKEN BUDGET (added 2026-08-10). When > 0 the iterator yields LISTS of
+        # samples obeying len(batch) * max_actions_in_batch <= token_budget,
+        # instead of one sample at a time. The caller then uses
+        # DataLoader(batch_size=None), so the list goes straight to collate_fn.
+        #
+        # Why this is needed: the --data_dir path bounds padded-batch GPU memory
+        # with TokenBudgetBatchSampler, but an IterableDataset cannot take a
+        # batch_sampler, so the shards path fell back to a flat batch_size=64.
+        # With ~12,700 actions per sample that is ~813k tokens, 12.4x over the
+        # 65,536 budget -- it OOM'd a 15.6 GB GPU inside the action encoder
+        # (tried to allocate 6.66 GiB in one torch.cat). It only ever worked on
+        # 40-80 GB cards. token_budget=0 keeps the old per-sample behaviour.
+        self.token_budget = int(token_budget)
+        self.max_batch = int(max_batch) if max_batch else 10**9
+        self.sort_window = max(1, int(sort_window))
         self.shard_files = [Path(p) for p in shard_files]
         self.shuffle = shuffle
         self.buffer_shards = int(buffer_shards) if shuffle else 1
@@ -178,6 +196,10 @@ class ShardedIBPDataset(IterableDataset):
         )
         if self.shuffle:
             rng.shuffle(files)
+
+        # in-progress token-budget batch (unused when token_budget <= 0)
+        cur: list = []
+        cur_max = 0
 
         # Active pool: each entry is [PackedDatasetV5, list_of_remaining_indices].
         pool: List[list] = []
@@ -216,12 +238,66 @@ class ShardedIBPDataset(IterableDataset):
             ds, idxs = pool[picked]
             # idxs was pre-shuffled, so pop() gives a random remaining sample.
             sample_idx = idxs.pop()
-            yield ds[sample_idx]
+            s = ds[sample_idx]
+
+            if self.token_budget <= 0:
+                yield s
+            else:
+                # Collect a WINDOW, then sort it by action count before
+                # batching. Greedy batching of a randomly-ordered stream packs
+                # terribly: one large sample either rides alone or truncates the
+                # batch being accumulated, and measured on this corpus that gave
+                # a MEDIAN BATCH SIZE OF 1 (23.5k batches into an epoch that
+                # should be a few thousand). Sorting groups similar sizes so the
+                # budget buys many small samples per batch and only genuinely
+                # huge ones ride alone -- which is what TokenBudgetBatchSampler
+                # achieves globally on the --data_dir path.
+                # Randomness is preserved at window granularity: the window is
+                # drawn at random from the shard pool, only its internal order
+                # is sorted, and the emitted batches are shuffled before use.
+                cur.append(s)
+                if len(cur) >= self.sort_window:
+                    for b in self._emit(cur, rng):
+                        yield b
+                    cur = []
 
             if not idxs:
                 # Shard exhausted — evict and pull in the next one.
                 del pool[picked]
                 _load_one()
+
+        # Flush the tail window. A partial window is still real data; dropping
+        # it would silently discard samples every epoch.
+        if self.token_budget > 0 and cur:
+            for b in self._emit(cur, rng):
+                yield b
+
+    def _emit(self, window, rng):
+        """Sort a window by action count and cut it into budgeted batches.
+
+        Same invariant as TokenBudgetBatchSampler: len(batch) * max_actions in
+        that batch <= token_budget, and len(batch) <= max_batch. Sorting is what
+        makes the budget buy a useful number of samples -- unsorted, one large
+        sample caps the whole batch.
+        """
+        window.sort(key=lambda s: len(s['action_ibp_ops']))
+        batches, cur, cur_max = [], [], 0
+        for s in window:
+            n = len(s['action_ibp_ops'])
+            m = max(cur_max, n)
+            if cur and ((len(cur) + 1) * m > self.token_budget
+                        or len(cur) >= self.max_batch):
+                batches.append(cur)
+                cur, cur_max = [s], n
+            else:
+                cur.append(s)
+                cur_max = m
+        if cur:
+            batches.append(cur)
+        # Sorting made batches size-ordered; shuffle so the model does not see
+        # every epoch's batches in ascending difficulty.
+        rng.shuffle(batches)
+        return batches
 
 
 def estimate_samples_per_epoch(

@@ -53,20 +53,83 @@ class PackedDatasetV5(Dataset):
         d = self.data
 
         expr_start, expr_end = d['expr_offsets'][idx].item(), d['expr_offsets'][idx + 1].item()
-        sub_start, sub_end = d['sub_offsets'][idx].item(), d['sub_offsets'][idx + 1].item()
         action_start, action_end = d['action_offsets'][idx].item(), d['action_offsets'][idx + 1].item()
+        # Corpora packed with include_subs=False carry no substitution fields at
+        # all (they are dead weight for the nosubs model, 44.6% of the bytes).
+        _has_subs = 'sub_offsets' in d
+        if _has_subs:
+            sub_start, sub_end = d['sub_offsets'][idx].item(), d['sub_offsets'][idx + 1].item()
 
         return {
             'expr_integrals': d['expr_integrals'][expr_start:expr_end],
             'expr_coeffs': d['expr_coeffs'][expr_start:expr_end],
-            'sub_integrals': d['sub_integrals'][sub_start:sub_end],
-            'subs_raw': d['subs_raw'][idx],  # Full substitution structure
+            'sub_integrals': (d['sub_integrals'][sub_start:sub_end] if _has_subs
+                              else torch.zeros(0, d['target_integrals'].shape[1],
+                                               dtype=torch.int8)),
+            'subs_raw': d['subs_raw'][idx] if _has_subs else [],
             'action_ibp_ops': d['action_ibp_ops'][action_start:action_end],
             'action_deltas': d['action_deltas'][action_start:action_end],
             'sector_mask': d['sector_masks'][idx],
             'target_integral': d['target_integrals'][idx],  # Target integral
+            # EXP 1: START target T. Falls back to the per-step target so
+            # packed files written before EXP 1 still load.
+            'start_target_integral': (d['start_target_integrals'][idx]
+                                     if 'start_target_integrals' in d
+                                     else d['target_integrals'][idx]),
+            # EXP 2: steps-to-go; 0 = unknown -> masked out of the value loss
+            'steps_remaining': (d['steps_remaining'][idx]
+                                if 'steps_remaining' in d else 0),
             'label': d['labels'][idx],
+            # MULTI-LABEL: every correct action for this state. Sliced from the
+            # flat store; empty when the shard predates the field, and the
+            # collate falls back to the single label so old shards still train.
+            'valid_label_idxs': (
+                d['valid_label_idxs'][
+                    int(d['valid_label_offsets'][idx]):
+                    int(d['valid_label_offsets'][idx + 1])]
+                if 'valid_label_offsets' in d else None),
         }
+
+
+class TokenBudgetBatchSampler(torch.utils.data.Sampler):
+    """Size-bucketed batch sampler: groups sample indices (sorted by action
+    count) so that len(batch) * max_num_valid_actions_in_batch <= token_budget
+    AND len(batch) <= max_batch. Exact softmax over every candidate action —
+    no subsampling — with padded-batch memory bounded by construction (a 33k-
+    action sample simply rides in a batch of 1). Batch ORDER is reshuffled per
+    epoch (set_epoch); batch composition is fixed (standard bucketing)."""
+
+    def __init__(self, num_actions, token_budget, max_batch, seed=0):
+        import random as _random
+        self._random = _random
+        self.token_budget = token_budget
+        self.seed = seed
+        self.epoch = 0
+        order = sorted(range(len(num_actions)), key=lambda i: int(num_actions[i]))
+        self.batches = []
+        cur, cur_max = [], 0
+        for i in order:
+            n = int(num_actions[i])
+            m = max(cur_max, n)
+            if cur and ((len(cur) + 1) * m > token_budget or len(cur) >= max_batch):
+                self.batches.append(cur)
+                cur, cur_max = [i], n
+            else:
+                cur.append(i)
+                cur_max = m
+        if cur:
+            self.batches.append(cur)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        b = list(self.batches)
+        self._random.Random(self.seed + self.epoch).shuffle(b)
+        return iter(b)
+
+    def __len__(self):
+        return len(self.batches)
 
 
 MAX_REPLACEMENT_TERMS = 20  # Max replacement terms per substitution
@@ -77,6 +140,81 @@ def make_collate_fn(n_indices, n_denominators):
     def collate_fn(samples):
         return _collate(samples, n_indices, n_denominators)
     return collate_fn
+
+
+# SAILIR_LOSS=set switches from hard cross-entropy to the partial-label
+# objective. Read once at import, not per batch.
+_SET_LOSS = os.environ.get('SAILIR_LOSS', 'ce') == 'set'
+_SOFT_LOSS = os.environ.get('SAILIR_LOSS', 'ce') == 'soft'
+if os.environ.get('SAILIR_LOSS', 'ce') not in ('ce', 'set', 'soft'):
+    raise SystemExit(f"unknown SAILIR_LOSS={os.environ['SAILIR_LOSS']!r} "
+                     f"(ce | set | soft)")
+
+
+def _action_loss(logits, batch):
+    """Cross-entropy, or the multi-label ('set') objective.
+
+    There are ~18 equally correct actions per state -- measured, and first /
+    last / random picks all reach a successful reduction -- so hard
+    cross-entropy against ONE of them actively penalises the model for
+    choosing any of the other ~17. Three training runs have now shown that the
+    choice of tie-break alone is worth ~20 points of val top1 (old label 87.4,
+    minsumw 67.1, lex worse), on a metric that does not measure what the search
+    needs.
+
+    The set loss is  -log( sum_{i in C} softmax(logits)_i )  -- maximise the
+    total probability mass on ANY correct action. Properties that matter here:
+      * no arbitrary tie-break survives in the target;
+      * it optimises exactly the quantity the beam cares about, "is the top
+        action a reducing one", rather than conformity to one convention;
+      * the model may concentrate on whichever candidate it finds easiest,
+        which is the brittleness that appears to sink a hard lex label -- there
+        the model must find THE lexicographic minimum, and a near miss is not a
+        similar action.
+    Computed as logsumexp over the candidate logits minus logsumexp over all,
+    which is numerically stable and never materialises the softmax.
+    """
+    if _SOFT_LOSS:
+        # SOFT-LABEL CROSS-ENTROPY: uniform target over the ~18 equally-correct
+        # actions. Ported from RL_amplitudes_claude/src/train_sft_5pt.py:128-131,
+        # where the identical problem (a set of equivalent actions, no canonical
+        # one) is already solved this way.
+        #
+        # WHY THIS AND NOT 'set'. The set loss -log(sum_{i in C} p_i) is
+        # satisfied by ANY SINGLE label reaching 1.0 -- it constrains only the
+        # TOTAL mass on C, never its distribution across C. Measured on
+        # rands_ep25: top_prob median 1.0000, saturated >0.9999 on 41 of 55
+        # steps, with label_prob_sum=1.000000. The model became confidently
+        # committed to one arbitrary correct row, which is optimal under that
+        # objective and useless to a beam: at the step where it finally erred,
+        # 37 closure rows shared 3e-06 of the mass, so none were rankable.
+        #
+        # Soft-label CE is minimised only when p MATCHES the uniform target, so
+        # every correct action carries ~1/|C|. Those rows then populate the
+        # top-K the beam expands instead of sitting six orders of magnitude
+        # below a confidently-wrong pick.
+        # NaN TRAP, hit on the first run: the scorer returns
+        # `logits.masked_fill(~action_mask, -inf)` (classifier.py:415), so
+        # PADDED action slots carry -inf and log_softmax gives -inf there. The
+        # soft target is 0 at those slots, and 0 * -inf = NaN -- loss=nan from
+        # batch 1 in both arms. The 'set' loss never hit this because logsumexp
+        # handles -inf cleanly (exp(-inf)=0).
+        # torch.where keeps the padded terms out of the product entirely rather
+        # than multiplying and repairing afterwards, so no NaN is ever created
+        # (nan_to_num after the fact would still poison the backward pass).
+        mask = batch['label_mask']
+        soft = mask.to(logits.dtype)
+        soft = soft / soft.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        logp = F.log_softmax(logits, dim=-1)
+        contrib = torch.where(soft > 0, soft * logp, torch.zeros_like(logp))
+        return -contrib.sum(dim=-1).mean()
+    if not _SET_LOSS:
+        return F.cross_entropy(logits, batch['labels'])
+    mask = batch['label_mask']
+    neg_inf = torch.finfo(logits.dtype).min
+    picked = logits.masked_fill(~mask, neg_inf)
+    return -(torch.logsumexp(picked, dim=-1)
+             - torch.logsumexp(logits, dim=-1)).mean()
 
 
 def _collate(samples, n_indices, n_denominators):
@@ -104,7 +242,13 @@ def _collate(samples, n_indices, n_denominators):
 
     sector_masks = torch.zeros(batch_size, n_denominators, dtype=torch.long)
     target_integrals = torch.zeros(batch_size, n_indices, dtype=torch.long)
+    start_target_integrals = torch.zeros(batch_size, n_indices, dtype=torch.long)
+    steps_remaining = torch.zeros(batch_size, dtype=torch.float)
     labels = torch.zeros(batch_size, dtype=torch.long)
+    # MULTI-LABEL target aligned with the logits: True at every action that is
+    # a correct choice for this state. Built here (not in the loss) so it is
+    # padded to max_action exactly like action_mask.
+    label_mask = torch.zeros(batch_size, max_action, dtype=torch.bool)
 
     for i, s in enumerate(samples):
         n_expr = len(s['expr_integrals'])
@@ -132,7 +276,21 @@ def _collate(samples, n_indices, n_denominators):
 
         sector_masks[i] = s['sector_mask'].long()
         target_integrals[i] = s['target_integral'].long()
+        start_target_integrals[i] = s['start_target_integral'].long()
+        steps_remaining[i] = float(s['steps_remaining'])
         labels[i] = s['label'].long()
+        _vl = s.get('valid_label_idxs')
+        if _vl is None or len(_vl) == 0:
+            # no recorded candidate set -> fall back to the single label, so the
+            # set loss reduces to plain cross-entropy on that row instead of
+            # taking log(0) over an empty set.
+            label_mask[i, labels[i]] = True
+        else:
+            _v = _vl.long()
+            # Guard against an index beyond this batch's padding width: the
+            # candidate indices refer to the sample's own action list, so they
+            # are < n_action <= max_action, but clamp rather than trust it.
+            label_mask[i, _v[_v < max_action]] = True
 
     return {
         'expr_integrals': expr_integrals,
@@ -148,7 +306,10 @@ def _collate(samples, n_indices, n_denominators):
         'action_mask': action_mask,
         'sector_mask': sector_masks,
         'target_integral': target_integrals,
+        'start_target_integral': start_target_integrals,
+        'steps_remaining': steps_remaining,
         'labels': labels,
+        'label_mask': label_mask,
     }
 
 
@@ -156,12 +317,63 @@ def model_forward(model, batch):
     """Call model with the standard positional args. Both `full` and `nosubs`
     variants accept the same 13-arg signature; `nosubs` ignores the sub_*
     tensors internally."""
+    kw = {}
+    # EXP 1: only pass T to a model that asks for it, so the `full` variant and
+    # any un-augmented `nosubs` checkpoint keep their exact 13-arg call.
+    m = model.module if hasattr(model, 'module') else model
+    if getattr(m, 'use_start_target', False):
+        kw['start_target_integral'] = batch['start_target_integral']
     return model(
         batch['expr_integrals'], batch['expr_coeffs'], batch['expr_mask'],
         batch['sub_keys'], batch['sub_repl_ints'], batch['sub_repl_coeffs'], batch['sub_repl_mask'], batch['sub_mask'],
         batch['action_ibp_ops'], batch['action_deltas'], batch['action_mask'],
-        batch['sector_mask'], batch['target_integral'],
+        batch['sector_mask'], batch['target_integral'], **kw,
     )
+
+
+def _ddp_synced_batches(dataloader, device, max_iters=None):
+    """Yield batches, stopping ALL ranks the moment ANY rank runs dry.
+
+    WHY. DDP needs every rank to do the same number of backward passes or the
+    NCCL all-reduce queues drift and the job hangs. `max_iters` guarantees that
+    when the per-rank batch count is known up front -- but under token budgeting
+    batches are variable, so it cannot be computed in advance (that is what the
+    SystemExit at the shards/token_budget guard used to forbid).
+
+    This gets the same guarantee dynamically: before each step every rank votes
+    on whether it still has data and the MIN is taken, so ranks stop together on
+    the first exhaustion. One 1-element all-reduce per step, against ~400 ms of
+    compute -- unmeasurable -- and it costs at most a partial final batch, the
+    same thing the static MIN cap discards.
+
+    Outside DDP this is a plain iterator: single-process runs are unchanged.
+    """
+    ddp_on = dist.is_available() and dist.is_initialized()
+    if not ddp_on:
+        for i, b in enumerate(dataloader):
+            if max_iters is not None and i >= max_iters:
+                return
+            yield i, b
+        return
+
+    it = iter(dataloader)
+    i = -1
+    while True:
+        i += 1
+        if max_iters is not None and i >= max_iters:
+            return
+        try:
+            b = next(it)
+        except StopIteration:
+            b = None
+        # MIN over ranks: a single 0 stops everyone, including the ranks that
+        # still had a batch in hand (they simply discard it).
+        flag = torch.tensor(1 if b is not None else 0,
+                            device=device, dtype=torch.long)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        if int(flag.item()) == 0:
+            return
+        yield i, b
 
 
 def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_batches=None,
@@ -172,25 +384,25 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
     total_loss = 0.0
     total_top1 = 0
     total_top5 = 0
+    total_top20 = 0
     total_samples = 0
 
     denom = f"/{total_batches}" if total_batches else ""
     t_prev = time.time()
 
-    for batch_idx, batch in enumerate(dataloader):
-        # Deterministic iteration cap — every DDP rank does EXACTLY max_iters
-        # backward passes, so NCCL allreduce queues stay aligned across ranks.
-        # This replaces the previous Join-based approach, which was probabilistic
-        # at scale (raced after 56K iterations / 2.5h wall time).
-        if max_iters is not None and batch_idx >= max_iters:
-            break
-
+    # Deterministic iteration cap — every DDP rank does EXACTLY max_iters
+    # backward passes, so NCCL allreduce queues stay aligned across ranks.
+    # This replaces the previous Join-based approach, which was probabilistic
+    # at scale (raced after 56K iterations / 2.5h wall time). When max_iters is
+    # None under DDP (token budgeting), _ddp_synced_batches keeps the ranks
+    # aligned by voting instead.
+    for batch_idx, batch in _ddp_synced_batches(dataloader, device, max_iters):
         batch = {k: v.to(device) for k, v in batch.items()}
         optimizer.zero_grad()
 
         logits, _ = model_forward(model, batch)
 
-        loss = F.cross_entropy(logits, batch['labels'])
+        loss = _action_loss(logits, batch)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -200,6 +412,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
         total_top1 += (logits.argmax(-1) == batch['labels']).sum().item()
         _, top5 = logits.topk(min(5, logits.size(1)), dim=-1)
         total_top5 += (top5 == batch['labels'].unsqueeze(1)).any(1).sum().item()
+        # top20: the beam expands the top-K actions per state, so "is the truth
+        # action inside the expanded set" is what actually gates the search.
+        _, top20 = logits.topk(min(20, logits.size(1)), dim=-1)
+        total_top20 += (top20 == batch['labels'].unsqueeze(1)).any(1).sum().item()
         total_samples += bs
 
         if log_every > 0 and (batch_idx + 1) % log_every == 0:
@@ -213,6 +429,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, log_every=1, total_
         'loss_sum': total_loss,
         'top1_sum': total_top1,
         'top5_sum': total_top5,
+        'top20_sum': total_top20,
         'n_samples': total_samples,
     }
 
@@ -224,25 +441,68 @@ def evaluate(model, dataloader, device, max_iters=None):
     total_loss = 0.0
     total_top1 = 0
     total_top5 = 0
+    total_top20 = 0
     total_samples = 0
+    total_anyhit = 0        # top-1 lands on ANY correct action
+    total_anyhit20 = 0      # ANY correct action inside the top-20
+    # COVERAGE@20 -- what FRACTION of the expanded top-K are correct, not just
+    # whether one is. anyhit20 is binary and saturates at 0.995-0.999, so it
+    # cannot distinguish a model that squeezes one correct action in from one
+    # that ranks the WHOLE valid set above the 500-3500 wrong ones. Measured on
+    # the beam, soft_ep10 gets 0.52-0.88 where anyhit20 only guarantees
+    # 1/20 = 0.05, and per parent lib_children ~= min(avail, 19).
+    #
+    # This is the quantity the BEAM actually consumes: each parent contributes
+    # its top-K children, so coverage@20 IS the expected number of correct
+    # children per expansion. Normalised by min(K, |C|) so a state with only 3
+    # correct actions can still score 1.0 rather than being capped at 3/20.
+    total_cov20 = 0.0
 
-    for batch_idx, batch in enumerate(dataloader):
-        if max_iters is not None and batch_idx >= max_iters:
-            break
+    for batch_idx, batch in _ddp_synced_batches(dataloader, device, max_iters):
         batch = {k: v.to(device) for k, v in batch.items()}
         logits, _ = model_forward(model, batch)
-        loss = F.cross_entropy(logits, batch['labels'])
+        loss = _action_loss(logits, batch)
         bs = batch['labels'].size(0)
+        # THE METRIC THAT MATCHES THE SEARCH. top1/top5/top20 below all score
+        # against ONE designated action out of ~18 equally correct ones, so they
+        # measure conformity to a convention. What the beam needs is simply that
+        # the chosen action reduces -- any candidate does. Reported alongside
+        # rather than instead, so the numbers stay comparable to earlier runs.
+        total_anyhit += batch['label_mask'].gather(
+            1, logits.argmax(-1, keepdim=True)).sum().item()
+        # ANYHIT20 -- the metric that matches DEPLOYMENT exactly. The beam
+        # expands the top-K=20 actions per state and any correct one lets the
+        # search proceed, so what gates it is "is at least one correct action
+        # inside the expanded set". anyhit above is the K=1 special case, and
+        # top20 is the other partial view (right K, but scored against the one
+        # arbitrarily-designated action). This is the union of both leniencies.
+        _k = min(20, logits.size(1))
+        _, _t20 = logits.topk(_k, dim=-1)
+        _hit20 = batch['label_mask'].gather(1, _t20)
+        total_anyhit20 += _hit20.any(1).sum().item()
+        _ncor = batch['label_mask'].sum(1).clamp(min=1)
+        total_cov20 += (_hit20.sum(1).float()
+                        / torch.minimum(_ncor,
+                                        torch.full_like(_ncor, _k)).float()
+                        ).sum().item()
         total_loss += loss.item() * bs
         total_top1 += (logits.argmax(-1) == batch['labels']).sum().item()
         _, top5 = logits.topk(min(5, logits.size(1)), dim=-1)
         total_top5 += (top5 == batch['labels'].unsqueeze(1)).any(1).sum().item()
+        # top20: the beam expands the top-K actions per state, so "is the truth
+        # action inside the expanded set" is what actually gates the search.
+        _, top20 = logits.topk(min(20, logits.size(1)), dim=-1)
+        total_top20 += (top20 == batch['labels'].unsqueeze(1)).any(1).sum().item()
         total_samples += bs
 
     return {
         'loss_sum': total_loss,
         'top1_sum': total_top1,
         'top5_sum': total_top5,
+        'top20_sum': total_top20,
+        'anyhit_sum': total_anyhit,
+        'anyhit20_sum': total_anyhit20,
+        'cov20_sum': total_cov20,
         'n_samples': total_samples,
     }
 
@@ -267,10 +527,70 @@ def main():
                         help='Number of shards held in the train shuffle buffer '
                              '(per DataLoader worker). Larger = better mixing, more RAM.')
     parser.add_argument('--output_dir', type=str, default='checkpoints')
+    parser.add_argument('--select_on', type=str, default='val_loss',
+                        choices=['val_loss', 'val_top20', 'val_top1',
+                                 'val_anyhit', 'val_anyhit20',
+                                 'extra_top20', 'extra_top1',
+                                 'dots_top20', 'dots_top1'],
+                        help='Metric that decides best_model.pt. Default '
+                             'val_loss is WRONG for beam-search deployment: '
+                             'cross-entropy is dominated by a shrinking set of '
+                             'confidently-WRONG samples (measured: wrong-sample '
+                             'loss 5.43->7.40 while top1/top5/top20 all rose), '
+                             'so it selects a checkpoint that is better '
+                             'calibrated on hopeless states rather than one '
+                             'that RANKS the truth action into the expanded '
+                             'top-K. The beam expands top-K per state, so '
+                             'dots_top20 is the metric that gates the search.')
+    parser.add_argument('--backbone_lr', type=float, default=0.0,
+                        help='If >0, train the BACKBONE (expr_enc, sector_enc, '
+                             'action_enc) at this lower LR while the head '
+                             '(state_combine, scorer) uses --lr. Middle ground '
+                             'between full fine-tuning (backbone drifts, '
+                             'forgetting) and --freeze (no adaptation at all). '
+                             'Both groups still follow the same cosine decay.')
+    parser.add_argument('--use_value_head', action='store_true',
+                        help='EXP 2: add a head predicting steps-to-go. The '
+                             'beam has no cost-to-go signal; this supplies one. '
+                             'Label is free (trajectory length - step index).')
+    parser.add_argument('--value_weight', type=float, default=1.0,
+                        help='weight of the value regression in the total loss')
+    parser.add_argument('--use_start_target', action='store_true',
+                        help='EXP 1: feed the START target T as a 4th state '
+                             'channel. Widens state_combine, so a v7 checkpoint '
+                             'must be converted first (see '
+                             'convert_v7_to_start_target.py).')
+    parser.add_argument('--freeze', type=str, default='',
+                        help='Comma-separated top-level module names to FREEZE '
+                             '(requires_grad=False), e.g. '
+                             '"expr_enc,sector_enc,action_enc" for head-only '
+                             'fine-tuning. Freezing makes catastrophic '
+                             'forgetting impossible in those modules by '
+                             'construction (vs merely penalised by L2-SP) and '
+                             'cuts trainable capacity, which is the binding '
+                             'constraint on a small dots corpus.')
+    parser.add_argument('--extra_val', type=str, default=None,
+                        help='Optional SECOND held-out packed .pt evaluated '
+                             'each epoch, logged as extra_* columns. Its '
+                             'contents are whatever file you point at — the '
+                             'columns are named "extra" precisely so they '
+                             'never imply a distribution. The MAIN val set is '
+                             'always <data_dir>/val.pt and is logged as val_*.')
+    parser.add_argument('--dots_val', type=str, default=None,
+                        help='DEPRECATED alias for --extra_val. The old name '
+                             'caused a real misreading: runs pointed it at a '
+                             'REPLAY holdout while the dots holdout sat in '
+                             'val.pt, so "dots_*" columns held replay numbers '
+                             'and vice-versa. Use --extra_val.')
     parser.add_argument('--log_file', type=str, default=None,
                         help='Optional path to write a per-epoch metrics TSV (epoch, train_loss, ...).')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--token_budget', type=int, default=0,
+                        help='If >0 (--data_dir mode only): use size-bucketed '
+                             'batches with len(batch)*max_actions <= budget '
+                             '(and len(batch) <= batch_size). Full action '
+                             'lists, no OOM from fat samples.')
     parser.add_argument('--lr', type=float, default=0.0004)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--embed_dim', type=int, default=256)
@@ -298,6 +618,10 @@ def main():
     parser.add_argument('--log_every', type=int, default=1,
                         help='Print per-batch metrics every N batches (1 = every batch).')
     args = parser.parse_args()
+    if args.extra_val is None and args.dots_val is not None:
+        args.extra_val = args.dots_val
+        print('NOTE: --dots_val is deprecated; use --extra_val '
+              '(columns are logged as extra_*).', flush=True)
 
     if (args.data_dir is None) == (args.shards_dir is None):
         parser.error('Exactly one of --data_dir or --shards_dir is required.')
@@ -436,32 +760,70 @@ def main():
         else:
             train_iter_cap = local_train_batches
             val_iter_cap = local_val_batches
-        log(f"  iteration cap: train={train_iter_cap}/rank, val={val_iter_cap}/rank "
-            f"(this rank had: {local_train_batches} train, {local_val_batches} val)")
 
+        # The cap above assumes a FIXED batch size (samples // batch_size). With
+        # the token budget on, batches are variable and far more numerous -- a
+        # sample with >32k actions rides alone -- so that number is a large
+        # UNDER-count and would silently truncate the epoch to a few percent of
+        # the corpus, with no error. The cap exists only to keep DDP ranks doing
+        # equal numbers of backward passes; single-process runs do not need it.
+        if args.token_budget:
+            # DDP + token budgeting used to be refused here: the per-rank batch
+            # count is not samples//batch_size when batches are variable, so no
+            # cap can be computed up front, and unequal backward-pass counts
+            # hang NCCL. _ddp_synced_batches now supplies that guarantee
+            # dynamically (ranks vote each step and stop together), so the cap
+            # is no longer needed and the combination is allowed.
+            #
+            # Do NOT "fix" this by setting --token_budget 0 instead: that path
+            # bypasses ShardedIBPDataset._emit, which is what sorts each window
+            # by action count. Measured on the corrupt cull corpus, sorted
+            # batching pads 1.009x vs 1.85x for unsorted -- turning the budget
+            # off would nearly double the model's work and cancel the DDP win.
+            train_iter_cap = None
+            val_iter_cap = None
+            log("  iteration cap: DISABLED (token budget -> variable batch "
+                "sizes; a fixed cap would truncate the epoch)")
+        else:
+            log(f"  iteration cap: train={train_iter_cap}/rank, val={val_iter_cap}/rank "
+                f"(this rank had: {local_train_batches} train, {local_val_batches} val)")
+
+        # Give the shards path the SAME padded-memory bound the --data_dir path
+        # gets from TokenBudgetBatchSampler. Without it this path builds flat
+        # batch_size batches, which at ~12,700 actions/sample is ~813k tokens --
+        # 12.4x the budget -- and OOMs a 15.6 GB GPU in the action encoder.
+        # The dataset then yields LISTS, so the DataLoader below must use
+        # batch_size=None (automatic batching off) and let collate see the list.
+        _tb = args.token_budget if args.token_budget else 0
         train_dataset = ShardedIBPDataset(
             train_shards, shuffle=True, buffer_shards=args.buffer_shards, seed=args.seed,
             rank=rank, world_size=world_size,
+            token_budget=_tb, max_batch=args.batch_size,
         )
         val_dataset = ShardedIBPDataset(
             val_shards, shuffle=False, buffer_shards=1, seed=args.seed,
             rank=rank, world_size=world_size,
+            token_budget=_tb, max_batch=args.batch_size,
         )
         # IterableDataset → shuffle=False at DataLoader; shuffling is handled
         # inside the dataset. persistent_workers=False so each iter(loader)
         # re-pickles the dataset to fresh workers, carrying the updated
         # _epoch from set_epoch() — persistent workers would freeze at _epoch=0.
+        # batch_size=None when the dataset is already emitting token-budgeted
+        # LISTS: automatic batching off, so collate_fn receives the list as-is.
+        _bs = None if _tb else args.batch_size
         train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=False,
+            train_dataset, batch_size=_bs, shuffle=False,
             collate_fn=collate, num_workers=args.num_workers, pin_memory=True,
             persistent_workers=False,
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False,
+            val_dataset, batch_size=_bs, shuffle=False,
             collate_fn=collate, num_workers=args.num_workers, pin_memory=True,
             persistent_workers=False,
         )
         # Per-rank batch count for the progress denominator string.
+        train_sampler = None
         approx_train_batches = train_iter_cap
         approx_val_batches = val_iter_cap
     else:
@@ -472,18 +834,40 @@ def main():
         log(f"Loaded in {time.time() - t0:.1f}s")
 
         assert 'target_integrals' in train_data, "Missing target_integrals!"
-        assert 'subs_raw' in train_data, "Missing subs_raw!"
         log(f"  target_integrals shape: {train_data['target_integrals'].shape}")
-        log(f"  subs_raw count: {len(train_data['subs_raw'])}")
+        # subs are OPTIONAL now: a corpus packed with include_subs=False has
+        # none, because the nosubs model deletes them on entry to forward().
+        if 'subs_raw' in train_data:
+            log(f"  subs_raw count: {len(train_data['subs_raw'])}")
+        else:
+            log("  subs: ABSENT (corpus packed without substitutions; "
+                "requires --model_variant nosubs)")
 
         train_dataset = PackedDatasetV5(train_data)
         val_dataset = PackedDatasetV5(val_data)
         log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                                collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
+        if args.token_budget > 0:
+            train_sampler = TokenBudgetBatchSampler(
+                train_data['num_valid_actions'].tolist(), args.token_budget,
+                args.batch_size, seed=args.seed)
+            val_sampler = TokenBudgetBatchSampler(
+                val_data['num_valid_actions'].tolist(), args.token_budget,
+                args.batch_size, seed=args.seed)
+            log(f"Token-budget batching: budget={args.token_budget}, "
+                f"train batches={len(train_sampler)}, val batches={len(val_sampler)}")
+            train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                      collate_fn=collate, num_workers=args.num_workers,
+                                      pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
+                                    collate_fn=collate, num_workers=args.num_workers,
+                                    pin_memory=True)
+        else:
+            train_sampler = None
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                      collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                    collate_fn=collate, num_workers=args.num_workers, pin_memory=True)
         approx_train_batches = len(train_loader)
         approx_val_batches = len(val_loader)
         # No cap needed for map-style dataset (DistributedSampler would give exact
@@ -493,9 +877,51 @@ def main():
 
         log(f"Train batches: {approx_train_batches}, Val batches: {approx_val_batches}")
 
+    # Extra dots-only held-out eval (deployment distribution).
+    dots_loader = None
+    if args.extra_val and os.path.exists(args.extra_val):
+        _dd = torch.load(args.extra_val, map_location='cpu', weights_only=False)
+        _dds = PackedDatasetV5(_dd)
+        _dsamp = TokenBudgetBatchSampler(
+            _dd['num_valid_actions'].tolist(), args.token_budget or 65536,
+            args.batch_size, seed=args.seed) if args.token_budget > 0 else None
+        dots_loader = (DataLoader(_dds, batch_sampler=_dsamp, collate_fn=collate,
+                                  num_workers=args.num_workers, pin_memory=True)
+                       if _dsamp is not None else
+                       DataLoader(_dds, batch_size=args.batch_size, shuffle=False,
+                                  collate_fn=collate, num_workers=args.num_workers,
+                                  pin_memory=True))
+        log(f"Extra held-out eval [{os.path.basename(args.extra_val)}]: "
+                f"{len(_dds)} samples -> logged as extra_* columns")
+
     from sailir import ibp_env
     ibp_env.init_from_topology(topology)
     ibp_env.set_prime(args.prime)
+
+    # A corpus packed with include_subs=False has NO substitution data. The
+    # collate would quietly hand the full model all-zero substitution tensors
+    # and it would train on them without complaint, so refuse the combination
+    # outright rather than produce a silently-degraded model.
+    # 'eqact' subclasses the nosubs model and deletes the sub_* arguments in
+    # forward() exactly as it does, so it needs no packed substitutions either;
+    # its action equations are resolved from the on-disk store by
+    # training/eqact_dataset.py. Listing it here rather than aliasing it to
+    # 'nosubs': the variant string is written into the checkpoint args, and
+    # onestep_worker_v9 constructs the model class from that field, so a lie
+    # here would build the wrong class at inference.
+    if args.model_variant not in ('nosubs', 'eqact'):
+        _probe = None
+        if args.data_dir:
+            _probe = train_data
+        elif train_shards:
+            _probe = torch.load(train_shards[0], map_location='cpu',
+                                weights_only=False)
+        if _probe is not None and 'subs_raw' not in _probe:
+            raise SystemExit(
+                f"--model_variant {args.model_variant} needs substitution data, "
+                f"but this corpus was packed without it (include_subs=False). "
+                f"Repack from the recordings, or use --model_variant nosubs.")
+        del _probe
 
     model_cls = MODEL_CLASSES[args.model_variant]
     model = model_cls(
@@ -503,18 +929,46 @@ def main():
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
         n_subs_layers=args.n_subs_layers, prime=args.prime,
         n_indices=n_indices, n_denominators=n_denominators, n_ibp_ops=n_actions,
+        **({'use_start_target': True} if args.use_start_target else {}),
+        **({'use_value_head': True} if args.use_value_head else {}),
     )
     model = model.to(device)
     log(f"Model variant: {args.model_variant} ({model_cls.__name__})")
     log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    if args.freeze:
+        _want = [m.strip() for m in args.freeze.split(',') if m.strip()]
+        _avail = dict(model.named_children())
+        _bad = [m for m in _want if m not in _avail]
+        if _bad:
+            raise SystemExit(f"--freeze: unknown module(s) {_bad}; "
+                             f"available: {sorted(_avail)}")
+        for _m in _want:
+            for _p in _avail[_m].parameters():
+                _p.requires_grad = False
+        _tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        _fr = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        log(f"FROZEN modules: {_want}")
+        log(f"  trainable={_tr:,}  frozen={_fr:,}  "
+            f"({100*_tr/(_tr+_fr):.1f}% trainable)")
+
     if ddp_enabled:
         # DDP: one process per GPU, model lives permanently on each. Only
         # gradients cross the interconnect, via NCCL all-reduce overlapped
         # with backward.
+        # static_graph: REQUIRED when the model uses activation checkpointing
+        # (eqact does, SAILIR_EQ_CKPT=1). Checkpointing re-runs the forward
+        # during backward, so DDP's reducer never sees those parameters in the
+        # first pass and aborts with "Expected to have finished reduction in the
+        # prior iteration ... parameters that were not used in producing loss"
+        # (observed: indices 279-286, the equation encoder). static_graph tells
+        # DDP the parameter set is identical every iteration, which is true
+        # here, and is cheaper than find_unused_parameters=True.
+        _static = os.environ.get('SAILIR_DDP_STATIC_GRAPH') == '1'
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=False)
-        log(f"Using DistributedDataParallel: world_size={world_size}")
+                    find_unused_parameters=False, static_graph=_static)
+        log(f"Using DistributedDataParallel: world_size={world_size} "
+            f"static_graph={_static}")
         base_model = model.module
     elif device == 'cuda' and torch.cuda.device_count() > 1:
         # Legacy DataParallel path — known to be slow on SYS-grade interconnects
@@ -528,7 +982,81 @@ def main():
     else:
         base_model = model
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Only optimise trainable params: with --freeze, passing frozen tensors to
+    # AdamW would still let weight_decay act on them (decay is applied to the
+    # param, not via .grad), silently drifting the "frozen" backbone.
+    _BACKBONE = ('expr_enc', 'sector_enc', 'action_enc')
+    if args.backbone_lr > 0:
+        _kids = dict(base_model.named_children())
+        _bb, _hd = [], []
+        # DEDUPE BY IDENTITY. With SAILIR_EQ_TIE, eq_enc shares modules with
+        # (or IS) expr_enc, so the same tensor is reachable from two children.
+        # Adding it to two param groups makes AdamW raise "some parameters
+        # appear in more than one parameter group"; adding it twice to ONE
+        # group would double its effective learning rate just as silently.
+        # Backbone wins the tie: a shared embedder is pretrained, so it belongs
+        # at the fine-tuning lr. Genuinely NEW tensors are lifted back out to
+        # the head lr by the _NEW rule below.
+        # Backbone children FIRST and explicitly, so "backbone wins" is a
+        # property of this loop rather than of dict registration order.
+        _seen = set()
+        for _want_bb in (True, False):
+            for _n, _m in _kids.items():
+                if (_n in _BACKBONE) != _want_bb:
+                    continue
+                _dst = _bb if _want_bb else _hd
+                for q in _m.parameters():
+                    if q.requires_grad and id(q) not in _seen:
+                        _seen.add(id(q))
+                        _dst.append(q)
+        # BARE PARAMETERS. named_children() yields sub-MODULES only, so an
+        # nn.Parameter declared directly on the model belongs to no child and
+        # was silently dropped from BOTH groups -- it then never updates.
+        # This cost 3 epochs: eqact's `eq_gate` is exactly such a scalar, so it
+        # stayed pinned at 0, and because the equation branch is added as
+        # `gate * branch`, every gradient into eq_enc/eq_proj was 0 too. All
+        # 111 eq_* tensors were bit-identical between epoch 1 and epoch 3 while
+        # all 186 others moved: the run was plain `nosubs` wearing eqact's name.
+        _bare = [q for _, q in base_model.named_parameters(recurse=False)
+                 if q.requires_grad]
+        _hd.extend(_bare)
+        # FRESHLY-INITIALISED parameters belong at the HEAD lr, not the
+        # backbone's fine-tuning lr, wherever they physically live. The
+        # coefficient lookup table sits inside expr_enc (a _BACKBONE child) but
+        # also inside eq_enc (not one), so without this it would train at 1e-5
+        # on one copy and 1e-4 on the other -- an asymmetry with no meaning.
+        _NEW = ('coeff_table',)
+        _name_of = {id(q): n for n, q in base_model.named_parameters()}
+        _moved = [q for q in _bb
+                  if any(t in _name_of.get(id(q), '') for t in _NEW)]
+        if _moved:
+            _mids = {id(q) for q in _moved}
+            _bb = [q for q in _bb if id(q) not in _mids]
+            _hd.extend(_moved)
+            log(f"  new-parameter routing: {len(_moved)} tensor(s) matching "
+                f"{_NEW} moved from backbone to head lr")
+        optimizer = torch.optim.AdamW(
+            [{'params': _bb, 'lr': args.backbone_lr},
+             {'params': _hd, 'lr': args.lr}],
+            lr=args.lr, weight_decay=args.weight_decay)
+        # Nothing trainable may go unoptimised. Silence here is what hid the
+        # bug -- the only symptom was a parameter count one short of the model.
+        _grouped = sum(q.numel() for q in _bb) + sum(q.numel() for q in _hd)
+        _trainable = sum(q.numel() for q in base_model.parameters()
+                         if q.requires_grad)
+        if _grouped != _trainable:
+            raise SystemExit(
+                f'optimizer groups cover {_grouped:,} of {_trainable:,} '
+                f'trainable params -- {_trainable - _grouped:,} would never '
+                f'update. Refusing to train.')
+        log(f"Discriminative LR: backbone({','.join(_BACKBONE)})="
+            f"{args.backbone_lr:.2e} over {sum(q.numel() for q in _bb):,} params"
+            f" | head={args.lr:.2e} over {sum(q.numel() for q in _hd):,} params"
+            f" | bare-on-model: {len(_bare)} tensor(s) -> head")
+    else:
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr/10)
 
     def _full_state(epoch, val_metrics, train_metrics=None):
@@ -555,8 +1083,46 @@ def main():
     if resume_path is not None:
         # map_location keeps each rank's parameters on its own device.
         ckpt = torch.load(resume_path, weights_only=False, map_location=device)
-        base_model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        _sd = ckpt['model_state_dict']
+        # WIDENING FOR use_start_target. The extra state channel makes
+        # state_combine's first Linear expect embed_dim*4 inputs where a
+        # checkpoint trained without it has embed_dim*3, so a plain load fails
+        # on shape. The channel is APPENDED last (classifier_nosubs.py:134,148),
+        # so the checkpoint's columns map onto the leading block and zeroing the
+        # remainder makes the new channel contribute exactly 0 -- the model
+        # reproduces the checkpoint and the channel must earn its way in.
+        # start_target_enc/start_proj are then legitimately absent; they feed
+        # ONLY that zeroed block, so their random init is multiplied by zero.
+        # Anything else missing is still a hard error.
+        if getattr(base_model, 'use_start_target', False):
+            _own = base_model.state_dict()
+            _k = 'state_combine.0.weight'
+            if _k in _sd and _sd[_k].shape[1] < _own[_k].shape[1]:
+                _wide = torch.zeros_like(_own[_k])
+                _wide[:, :_sd[_k].shape[1]] = _sd[_k]
+                _sd = dict(_sd); _sd[_k] = _wide
+                log(f"  widened {_k} {tuple(ckpt['model_state_dict'][_k].shape)}"
+                    f" -> {tuple(_own[_k].shape)}; start-target block zeroed "
+                    f"-> model is bit-identical to the checkpoint")
+            _missing = set(_own) - set(_sd)
+            if _missing and all(('start_target_enc' in m or 'start_proj' in m)
+                                for m in _missing):
+                log(f"  {len(_missing)} start-target tensor(s) absent from the "
+                    f"checkpoint, left at init (inert behind the zeroed block)")
+                base_model.load_state_dict(_sd, strict=False)
+            else:
+                base_model.load_state_dict(_sd)
+        else:
+            base_model.load_state_dict(_sd)
+        # With --freeze the optimizer holds only the trainable subset, so a
+        # checkpoint's optimizer state (built over ALL params) has a
+        # mismatched param group and cannot be loaded. Its momentum/variance
+        # buffers are meaningless for a frozen subset anyway — start fresh.
+        if args.freeze or args.backbone_lr > 0:
+            log("  --freeze/--backbone_lr set: skipping optimizer state "
+                "(param groups differ from the checkpoint's)")
+        else:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         else:
@@ -571,7 +1137,9 @@ def main():
     if args.log_file and is_main:
         log_fp = open(args.log_file, 'a')
         if log_fp.tell() == 0:
-            log_fp.write("epoch\ttrain_loss\ttrain_top1\ttrain_top5\tval_loss\tval_top1\tval_top5\tlr\twall_s\n")
+            log_fp.write("epoch\ttrain_loss\ttrain_top1\ttrain_top5\tval_loss\tval_top1\tval_top5"
+                         "\textra_loss\textra_top1\textra_top5"
+                         "\tval_top20\textra_top20\tval_anyhit\tval_anyhit20\tlr\twall_s\n")
             log_fp.flush()
 
     def aggregate_metrics(raw):
@@ -584,13 +1152,26 @@ def main():
         loss_sum = raw['loss_sum']
         top1_sum = raw['top1_sum']
         top5_sum = raw['top5_sum']
+        top20_sum = raw.get('top20_sum', 0)
+        # 0 for the TRAIN loop, which does not compute it (it is a validation
+        # diagnostic, and the train loop's job is the loss).
+        anyhit_sum = raw.get('anyhit_sum', 0)
+        anyhit20_sum = raw.get('anyhit20_sum', 0)
+        cov20_sum = raw.get('cov20_sum', 0.0)
         n = raw['n_samples']
         if ddp_enabled:
-            t = torch.tensor([loss_sum, top1_sum, top5_sum, n], device=device, dtype=torch.float64)
+            t = torch.tensor([loss_sum, top1_sum, top5_sum, top20_sum,
+                              anyhit_sum, anyhit20_sum, cov20_sum, n],
+                             device=device, dtype=torch.float64)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            loss_sum, top1_sum, top5_sum, n = t.tolist()
+            (loss_sum, top1_sum, top5_sum, top20_sum,
+             anyhit_sum, anyhit20_sum, cov20_sum, n) = t.tolist()
         n = max(int(n), 1)
-        return {'loss': loss_sum / n, 'top1_acc': top1_sum / n, 'top5_acc': top5_sum / n}
+        return {'loss': loss_sum / n, 'cov20': cov20_sum / n,
+                'top1_acc': top1_sum / n,
+                'top5_acc': top5_sum / n, 'top20_acc': top20_sum / n,
+                'anyhit_acc': anyhit_sum / n,
+                'anyhit20_acc': anyhit20_sum / n}
 
     log("\nStarting training...")
     log("=" * 70)
@@ -599,6 +1180,8 @@ def main():
         t0 = time.time()
         if hasattr(train_dataset, 'set_epoch'):
             train_dataset.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_raw = train_epoch(
             model, train_loader, optimizer, device, epoch,
             log_every=args.log_every if is_main else 0,
@@ -606,21 +1189,53 @@ def main():
             max_iters=train_iter_cap,
         )
         val_raw = evaluate(model, val_loader, device, max_iters=val_iter_cap)
+        dots_raw = (evaluate(model, dots_loader, device)
+                    if dots_loader is not None else None)
         scheduler.step()
 
         # Sample-weighted aggregation across DDP ranks.
         train_m = aggregate_metrics(train_raw)
         val_m = aggregate_metrics(val_raw)
+        dots_m = aggregate_metrics(dots_raw) if dots_raw is not None else None
 
         wall = time.time() - t0
         cur_lr = optimizer.param_groups[0]['lr']
         log(f"Epoch {epoch}/{args.epochs} ({wall:.1f}s, lr={cur_lr:.2e}):")
         log(f"  Train: loss={train_m['loss']:.4f}, top1={train_m['top1_acc']:.4f}, top5={train_m['top5_acc']:.4f}")
-        log(f"  Val:   loss={val_m['loss']:.4f}, top1={val_m['top1_acc']:.4f}, top5={val_m['top5_acc']:.4f}")
+        log(f"  Val:   loss={val_m['loss']:.4f}, top1={val_m['top1_acc']:.4f}, "
+            f"top5={val_m['top5_acc']:.4f}, TOP20={val_m.get('top20_acc', 0):.4f}")
+        if dots_m is not None:
+            log(f"  Extra[{os.path.basename(args.extra_val)}]: "
+                f"loss={dots_m['loss']:.4f}, top1={dots_m['top1_acc']:.4f}, "
+                f"top5={dots_m['top5_acc']:.4f}, TOP20={dots_m.get('top20_acc', 0):.4f}")
 
-        is_best = val_m['loss'] < best_val_loss
+        # Selection metric. best_val_loss holds the score being tracked; for
+        # accuracy-style criteria we store the NEGATIVE so "lower is better"
+        # stays uniform (and stays compatible with resumed checkpoints).
+        if args.select_on == 'val_loss':
+            _score = val_m['loss']
+        elif args.select_on == 'val_top20':
+            _score = -val_m.get('top20_acc', 0.0)
+        elif args.select_on == 'val_top1':
+            _score = -val_m['top1_acc']
+        elif args.select_on == 'val_anyhit20':
+            # THE deployment metric: any correct action inside the top-K=20 the
+            # beam actually expands. anyhit (K=1) is a proxy for it.
+            _score = -val_m.get('anyhit20_acc', 0.0)
+        elif args.select_on == 'val_anyhit':
+            # Select on "top-1 is A reducing action", not on agreement with the
+            # ONE arbitrarily-recorded pick out of ~24 equally correct ones.
+            # Measured at epoch 1 of the multi-label run: anyhit 0.891 while
+            # top1 was 0.117 -- selecting on top1/top20 would rank checkpoints
+            # by conformity to a convention the set loss deliberately ignores.
+            _score = -val_m.get('anyhit_acc', 0.0)
+        elif args.select_on in ('extra_top20', 'dots_top20'):
+            _score = -(dots_m or val_m).get('top20_acc', 0.0)
+        elif args.select_on in ('extra_top1', 'dots_top1'):
+            _score = -(dots_m or val_m)['top1_acc']
+        is_best = _score < best_val_loss
         if is_best:
-            best_val_loss = val_m['loss']
+            best_val_loss = _score
 
         if is_main:
             # Always save last.pt — atomic via temp-then-rename.
@@ -631,15 +1246,27 @@ def main():
 
             if is_best:
                 torch.save(state, output_dir / 'best_model.pt')
-                log(f"  -> New best val loss! Saved best_model.pt")
+                # Name the metric actually used. The message used to say "val
+                # loss" regardless of --select_on, which is misleading in the
+                # logs of a run selecting on, say, val_anyhit.
+                log(f"  -> New best {args.select_on}! Saved best_model.pt")
 
             if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
                 torch.save(state, output_dir / f'checkpoint_epoch{epoch}.pt')
 
             if log_fp is not None:
+                _d = (f"\t{dots_m['loss']:.6f}\t{dots_m['top1_acc']:.6f}\t{dots_m['top5_acc']:.6f}"
+                      if dots_m is not None else "\t\t\t")
+                _d += f"\t{val_m.get('top20_acc', 0):.6f}"
+                _d += (f"\t{dots_m.get('top20_acc', 0):.6f}"
+                       if dots_m is not None else "\t")
+                # appended LAST so existing column positions are unchanged and
+                # every earlier epochs.tsv stays parseable by the same scripts
+                _d += f"\t{val_m.get('anyhit_acc', 0):.6f}"
+                _d += f"\t{val_m.get('anyhit20_acc', 0):.6f}"
                 log_fp.write(f"{epoch}\t{train_m['loss']:.6f}\t{train_m['top1_acc']:.6f}\t{train_m['top5_acc']:.6f}"
                              f"\t{val_m['loss']:.6f}\t{val_m['top1_acc']:.6f}\t{val_m['top5_acc']:.6f}"
-                             f"\t{cur_lr:.6e}\t{wall:.1f}\n")
+                             f"{_d}\t{cur_lr:.6e}\t{wall:.1f}\n")
                 log_fp.flush()
 
         if ddp_enabled:
