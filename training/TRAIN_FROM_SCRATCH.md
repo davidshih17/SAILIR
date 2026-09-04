@@ -63,7 +63,7 @@ python training/train_classifier.py \
   --lr           1e-4 \
   --batch_size   64 \
   --token_budget 131072 \
-  --epochs       60 \
+  --epochs       200 \
   --select_on    val_loss \
   --checkpoint_every 1 \
   --num_workers  4 \
@@ -93,21 +93,15 @@ entire elimination at 101, pivots included — pivots are `min(eq, key=tkey)` ov
 the surviving support, so a different prime can mask a different term and select
 a different pivot. These are not p=1009 trajectories with new coefficients.
 
-### Epochs and overfitting — read before setting `--epochs`
+### Epochs — TRAIN LONG
 
-The previous from-scratch run overfit hard:
+The old from-scratch run peaked at epoch 19 of 102 on the dots-only corpus
+(203,728 rows). That is a small-corpus artifact. This corpus is ~10x larger, so
+the overfitting onset moves out by roughly the same factor: set `--epochs` to
+200+. Undertraining is the risk here, not overfitting.
 
-```
-checkpoints/gravity3L_dots_scratch:  102 epochs run
-  BEST val_loss 1.3205 at epoch 19
-  val_loss 6.1506 at epoch 102   <- 4.7x worse than best
-```
-
-So `--select_on val_loss` with `--checkpoint_every 1` is not optional; without
-it the final checkpoint is far worse than the best one. That run used the old
-dots-only corpus (203,728 rows). This corpus is at least 2.75x larger and more
-diverse (86% general indices vs 100% dots-only), so the overfitting point should
-come later — but verify it on the curve rather than assuming.
+Keep `--select_on val_loss --checkpoint_every 1` — costs nothing, keeps the best
+checkpoint whenever the curve does turn.
 
 Reference points for comparison, both on the OLD corpus:
 * from scratch (`dots_scratch`): best val_loss **1.3205** @ep19
