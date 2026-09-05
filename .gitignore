@@ -79,5 +79,10 @@ topology_input/*/kira_*/
 # on init.pt), and every .pt is 50-60 MB. Checkpoints move out of band.
 *.pt
 
+# EXCEPTION: the gravity3L p=101 from-scratch model, committed so it can be
+# evaluated off-site. Must come after the blanket *.pt above -- in gitignore
+# the LAST matching rule wins, so a negation placed earlier has no effect.
+!checkpoints/gravity3L_p101_scratch/best_model.pt
+
 # Job marker files
 .done_*

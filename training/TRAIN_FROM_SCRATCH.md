@@ -103,21 +103,44 @@ the overfitting onset moves out by roughly the same factor: set `--epochs` to
 Keep `--select_on val_loss --checkpoint_every 1` — costs nothing, keeps the best
 checkpoint whenever the curve does turn.
 
-Reference points for comparison, both on the OLD corpus:
+Historical numbers, both on the OLD corpus:
 * from scratch (`dots_scratch`): best val_loss **1.3205** @ep19
 * ftcull fine-tune: best val_loss **0.5400** / top1 0.8677 @ep19
 
-A from-scratch run starting from a much larger corpus should be compared against
-the 1.3205 figure, not the 0.5400 one — the latter had a large unscramble
-pretrain behind it.
+**Neither is a valid baseline for this run — do not compare val_loss against
+them.** The old corpus is **dots-only**; this one covers **all indices**. That
+is a different problem, not a bigger version of the same one: the action set,
+the reachable state distribution, and therefore the loss floor all differ. A
+number from one says nothing about a number from the other.
+
+(The same caveat applies for a second, independent reason: val_loss across
+different K is not comparable either — a K=100 problem has a lower loss floor
+than K=1000, and this corpus is K=1000.)
+
+So val_loss here is only meaningful **relative to itself** — as a curve to
+watch for its minimum, which is what `--select_on val_loss` uses it for. The
+cross-run judgement is beam solve behaviour on the 125 test integrals.
 
 ## Checkpoint selection
 
-Select on `val_loss`, NOT `val_top20`: `val_top20` previously picked a
+**This run selects on `val_loss`.** Rationale: `val_top20` previously picked a
 checkpoint that then FAILED the beam campaign while the `val_loss` minimum
 succeeded. And val_loss across different K is NOT comparable — a K=100 problem
 has a lower loss floor than K=1000. This corpus is K=1000.
 
+Be aware there is measured evidence pointing the other way, recorded in the
+`--select_on` help text in `train_classifier.py`: cross-entropy is dominated by
+a shrinking set of confidently-wrong samples (wrong-sample loss 5.43 → 7.40
+while top1/top5/top20 all rose), so val_loss can favour a checkpoint that is
+better calibrated on hopeless states over one that ranks the truth action into
+the top-K the beam actually expands. That argument motivates `dots_top20`,
+which needs an `--extra_val`/`--dots_val` set this run does not pass.
+
+The two findings are from different campaigns and neither has been retested on
+this corpus, so the question is open. We take `val_loss` here and record it.
+
 Ultimately the metric that decides is beam solve behaviour on the 125 test
 integrals, not val_loss. The eqact T=10 model beat the baseline on val_loss
-(0.5242 vs 0.5400) and still lost on wall-clock.
+(0.5242 vs 0.5400) and still lost on wall-clock. Keep
+`--checkpoint_every 1` so that if the val_loss pick disappoints on the beam
+campaign, the per-epoch checkpoints are all still on disk to re-select from.

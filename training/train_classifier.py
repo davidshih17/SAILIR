@@ -533,15 +533,23 @@ def main():
                                  'extra_top20', 'extra_top1',
                                  'dots_top20', 'dots_top1'],
                         help='Metric that decides best_model.pt. Default '
-                             'val_loss is WRONG for beam-search deployment: '
-                             'cross-entropy is dominated by a shrinking set of '
+                             'val_loss. NOTE: which metric to select on is '
+                             'NOT settled, and there is measured evidence '
+                             'both ways. (a) Against val_loss: cross-entropy '
+                             'is dominated by a shrinking set of '
                              'confidently-WRONG samples (measured: wrong-sample '
                              'loss 5.43->7.40 while top1/top5/top20 all rose), '
-                             'so it selects a checkpoint that is better '
-                             'calibrated on hopeless states rather than one '
-                             'that RANKS the truth action into the expanded '
-                             'top-K. The beam expands top-K per state, so '
-                             'dots_top20 is the metric that gates the search.')
+                             'so it can select a checkpoint better calibrated '
+                             'on hopeless states rather than one that RANKS '
+                             'the truth action into the top-K the beam '
+                             'expands. (b) For val_loss: on an earlier '
+                             'campaign val_top20 picked a checkpoint that then '
+                             'FAILED the beam campaign while the val_loss '
+                             'minimum succeeded. The arbiter is beam solve '
+                             'behaviour on the 125 test integrals, not any '
+                             'val-set number -- pick per run and record which. '
+                             'The gravity3L p=101 from-scratch run uses '
+                             'val_loss (see training/TRAIN_FROM_SCRATCH.md).')
     parser.add_argument('--backbone_lr', type=float, default=0.0,
                         help='If >0, train the BACKBONE (expr_enc, sector_enc, '
                              'action_enc) at this lower LR while the head '
@@ -584,6 +592,31 @@ def main():
                              'and vice-versa. Use --extra_val.')
     parser.add_argument('--log_file', type=str, default=None,
                         help='Optional path to write a per-epoch metrics TSV (epoch, train_loss, ...).')
+    parser.add_argument('--lr_schedule', type=str, default='cosine',
+                        choices=['cosine', 'plateau'],
+                        help='LR schedule. "cosine": CosineAnnealingLR with '
+                             'T_max=--epochs, eta_min=lr/10 (the original '
+                             'behaviour). "plateau": ReduceLROnPlateau on '
+                             'val_loss -- cuts LR by --plateau_factor after '
+                             '--plateau_patience epochs without a val_loss '
+                             'improvement. Use plateau when the convergence '
+                             'horizon is unknown: cosine with a large T_max '
+                             'spends its first quarter at ~peak LR, so if the '
+                             'model plateaus early the anneal arrives far too '
+                             'late to help.')
+    parser.add_argument('--plateau_factor', type=float, default=0.3,
+                        help='--lr_schedule plateau: multiply LR by this on each cut.')
+    parser.add_argument('--plateau_patience', type=int, default=5,
+                        help='--lr_schedule plateau: epochs without improvement '
+                             'before cutting. MUST exceed the val_loss '
+                             'oscillation period or it fires on noise '
+                             '(observed on gravity3L p101: ~3-epoch dip-and-'
+                             'recover swings, so 5 is the floor).')
+    parser.add_argument('--plateau_threshold', type=float, default=1e-3,
+                        help='--lr_schedule plateau: relative improvement below '
+                             'this counts as no improvement.')
+    parser.add_argument('--plateau_min_lr', type=float, default=1e-6,
+                        help='--lr_schedule plateau: floor for the LR.')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--token_budget', type=int, default=0,
@@ -1057,7 +1090,18 @@ def main():
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr/10)
+    if args.lr_schedule == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.plateau_factor,
+            patience=args.plateau_patience, threshold=args.plateau_threshold,
+            threshold_mode='rel', min_lr=args.plateau_min_lr)
+        log(f"LR schedule: ReduceLROnPlateau(val_loss) factor={args.plateau_factor} "
+            f"patience={args.plateau_patience} threshold={args.plateau_threshold} "
+            f"min_lr={args.plateau_min_lr}")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr/10)
+        log(f"LR schedule: CosineAnnealingLR T_max={args.epochs} eta_min={args.lr/10:.2e}")
 
     def _full_state(epoch, val_metrics, train_metrics=None):
         # Persist enough state that a resumed run continues the cosine LR
@@ -1067,6 +1111,11 @@ def main():
             'model_state_dict': base_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            # Record which schedule produced that state so a resume can refuse
+            # to load a CosineAnnealingLR state into a ReduceLROnPlateau (their
+            # state_dicts share no keys; load_state_dict would silently inject
+            # junk attributes rather than error).
+            'lr_schedule': args.lr_schedule,
             'val_metrics': val_metrics,
             'train_metrics': train_metrics,
             'best_val_loss': best_val_loss,
@@ -1123,9 +1172,17 @@ def main():
                 "(param groups differ from the checkpoint's)")
         else:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt:
+        ckpt_sched = ckpt.get('lr_schedule', 'cosine')
+        if ckpt_sched != args.lr_schedule:
+            # Deliberate schedule change across a resume. Keep the model and
+            # optimizer state, start the new schedule fresh -- for plateau that
+            # means its "best" begins unset, so the first epochs after the
+            # switch re-establish the baseline before any cut can fire.
+            log(f"  LR schedule changed ({ckpt_sched} -> {args.lr_schedule}): "
+                f"starting the new scheduler fresh, NOT loading its state")
+        elif 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        else:
+        elif args.lr_schedule == 'cosine':
             for _ in range(ckpt['epoch']):
                 scheduler.step()
         start_epoch = ckpt['epoch'] + 1
@@ -1191,12 +1248,20 @@ def main():
         val_raw = evaluate(model, val_loader, device, max_iters=val_iter_cap)
         dots_raw = (evaluate(model, dots_loader, device)
                     if dots_loader is not None else None)
-        scheduler.step()
+        # NOTE: scheduler.step() moved below the aggregation --
+        # ReduceLROnPlateau needs the val_loss it monitors, and that value must
+        # be the DDP-aggregated one so every rank steps identically (stepping
+        # on per-rank losses would drift the LR apart across ranks).
 
         # Sample-weighted aggregation across DDP ranks.
         train_m = aggregate_metrics(train_raw)
         val_m = aggregate_metrics(val_raw)
         dots_m = aggregate_metrics(dots_raw) if dots_raw is not None else None
+
+        if args.lr_schedule == 'plateau':
+            scheduler.step(val_m['loss'])
+        else:
+            scheduler.step()
 
         wall = time.time() - t0
         cur_lr = optimizer.param_groups[0]['lr']
