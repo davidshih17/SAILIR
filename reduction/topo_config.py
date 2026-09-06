@@ -18,7 +18,19 @@ Each entry:
 import os
 
 ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
-TOPOLOGY = os.environ.get('SAILIR_TOPOLOGY', 'pentagonbox')
+TOPOLOGY = os.environ.get('SAILIR_TOPOLOGY')
+if TOPOLOGY is None:
+    # 2026-08-03: the silent pentagonbox default produced wrong-topology
+    # measurements twice (equations solving to None, diagnostics comparing
+    # None==None -> fabricated conclusions). Defaulting now requires explicit
+    # opt-in; unset is a hard error so wrong-family runs die at import.
+    if os.environ.get('SAILIR_ALLOW_DEFAULT_TOPOLOGY', '0') == '1':
+        TOPOLOGY = 'pentagonbox'
+    else:
+        raise RuntimeError(
+            "SAILIR_TOPOLOGY is not set. Set SAILIR_TOPOLOGY=<family> "
+            "(e.g. gravity3L / pentagonbox), or explicitly opt into the "
+            "legacy default with SAILIR_ALLOW_DEFAULT_TOPOLOGY=1.")
 
 _CFG = {
     'pentagonbox': dict(

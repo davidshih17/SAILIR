@@ -40,7 +40,19 @@ from sailir import ibp_env
 from sailir.topology import Topology
 import topo_config as _tc
 
-P = 1009
+# The field the whole elimination runs in. Configurable because a prime change
+# is NOT a config change downstream: mod-p coefficients cannot be converted
+# between coprime moduli (c mod 1009 carries no information about c mod 101), so
+# any corpus is tied to the prime it was generated under, and the model's
+# nn.Embedding(prime, ...) row count is baked into its checkpoint. Default 1009
+# keeps every existing run bit-identical.
+P = int(os.environ.get('SAILIR_PRIME', '1009'))
+
+# Per-rung seed budget for the escalation ladder. A rung whose projected
+# seed count exceeds this is SKIPPED without building its system. Default
+# 25000 preserves historical behaviour exactly; the dots-only corpus never
+# exceeded it, but real g1023 targets (r=8-11) blow past it on rung ONE.
+_SEED_BUDGET = int(os.environ.get('SAILIR_SEED_BUDGET', '25000'))
 
 
 def rs_of(t):
@@ -188,8 +200,14 @@ class TruthEngine:
                   f"master-pivot-skipped={n_master_piv} ({time.time()-t0:.1f}s)",
                   flush=True)
         self.systems[key] = rules
-        with open(path, "wb") as f:
-            pickle.dump(rules, f)
+        # SAILIR_NO_SYSTEM_CACHE=1: skip persistence. A single system runs
+        # 269 MB - 1.47 GB on disk and the 18k-target corpus needs 2,317
+        # distinct ones (up to 2.3 TB) on a filesystem already at 91%. When
+        # targets are BATCHED BY SYSTEM the on-disk cache buys nothing anyway:
+        # the group builds its system once in RAM and reuses it in-process.
+        if os.environ.get('SAILIR_NO_SYSTEM_CACHE', '0') != '1':
+            with open(path, "wb") as f:
+                pickle.dump(rules, f)
         return rules
 
     # ---- targeted local rule construction ---------------------------------
@@ -268,12 +286,18 @@ class TruthEngine:
         return False
 
     # ---- replay ------------------------------------------------------------
-    def reduce(self, T, dr=1, ds=1, record_states=False, max_steps=200000):
+    def reduce(self, T, dr=1, ds=1, record_states=False, max_steps=200000,
+               recorder=None):
         """Full truth reduction of T to masters. Returns dict with final_expr,
         trajectory [(pivot, op, delta)], stats. record_states=True additionally
         snapshots the expression before every step — MEMORY-HEAVY (GBs on long
         replays); default off, states are exactly reconstructable by replaying
-        the trajectory against the persisted systems."""
+        the trajectory against the persisted systems.
+
+        recorder: optional callback invoked BEFORE each substitution as
+        recorder(step, J, op, seed, tail, expr) — used by
+        truth_record_training.py to emit training samples; must not mutate
+        expr."""
         T = tuple(T)
         expr = {T: 1 % P}
         traj = []
@@ -321,6 +345,8 @@ class TruthEngine:
             tail, op, seed = rules[J][:3]
             if record_states:
                 states.append(dict(expr))
+            if recorder is not None:
+                recorder(step, J, op, seed, tail, expr, rules)
             traj.append((J, op, tuple(x - y for x, y in zip(seed, J))))
             co = expr.pop(J)
             for K, cK in tail.items():
@@ -372,16 +398,42 @@ class TruthEngine:
         for (a, b) in [(dr, ds), (dr + 1, ds), (dr + 2, ds), (dr + 3, ds),
                        (dr + 4, ds), (dr + 5, ds), (dr + 1, ds + 1),
                        (dr + 2, ds + 1), (dr + 3, ds + 1)]:
-            if sum(1 for _ in self._seeds(S, r + a, s + b)) > 25000:
+            if sum(1 for _ in self._seeds(S, r + a, s + b)) > _SEED_BUDGET:
                 continue
-            self.systems.clear()     # evict prior rungs — persisted on disk;
-            #                          keeps peak memory to ONE system
+            # Evict prior rungs to keep peak memory at ONE system. With
+            # SAILIR_KEEP_SYSTEMS=1 the in-memory cache is retained instead,
+            # so a batch of targets SHARING a system builds it once rather
+            # than once per target -- the whole point of grouping. Safe only
+            # because a group's targets resolve to the same rung; memory stays
+            # ~one system (measured ~4 GB at 36-54k seeds).
+            if os.environ.get('SAILIR_KEEP_SYSTEMS', '0') != '1':
+                self.systems.clear()
             rules = self.build_system(S, r + a, s + b, verbose=verbose)
             if T in rules or self.build_rule_for(T, rules):
                 break
         else:
+            # Distinguish the two failure modes: a ladder that was explored and
+            # came up empty needs more DEPTH, but a ladder whose every rung was
+            # rejected by the seed budget was never explored at all, and raising
+            # --dr/--ds there changes nothing (deeper rungs have MORE seeds).
+            _n = [(a, b, sum(1 for _ in self._seeds(S, r + a, s + b)))
+                  for (a, b) in [(dr, ds), (dr + 1, ds), (dr + 2, ds),
+                                 (dr + 3, ds), (dr + 4, ds), (dr + 5, ds),
+                                 (dr + 1, ds + 1), (dr + 2, ds + 1),
+                                 (dr + 3, ds + 1)]]
+            _over = [x for x in _n if x[2] > _SEED_BUDGET]
+            if len(_over) == len(_n):
+                raise RuntimeError(
+                    f"no rule for target {list(T)}: ALL {len(_n)} ladder rungs "
+                    f"were skipped by the seed budget {_SEED_BUDGET:,} "
+                    f"(cheapest rung needs {min(x[2] for x in _n):,} seeds at "
+                    f"r={r}+{_n[0][0]} s={s}+{_n[0][1]}). build_system was never "
+                    f"called. Raise SAILIR_SEED_BUDGET — raising --dr/--ds "
+                    f"cannot help, deeper rungs need MORE seeds.")
             raise RuntimeError(f"no rule for target {list(T)} within the "
-                               f"escalation ladder — raise --dr/--ds")
+                               f"escalation ladder ({len(_over)}/{len(_n)} rungs "
+                               f"skipped by seed budget {_SEED_BUDGET:,}) — "
+                               f"raise --dr/--ds")
 
         # dependencies-first emission order (iterative postorder over the
         # recorded dependency sets; acyclic by construction: a rule only ever

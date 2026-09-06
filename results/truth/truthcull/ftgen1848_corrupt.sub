@@ -1,0 +1,29 @@
+universe = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/ab_worker.sh
+arguments = "$(integral) 1000 1000000"
+# CORRUPTED FINE-TUNING CORPUS. Same generator as ftgen1848 (the clean corpus in
+# ftdata1848/), with random-scramble corruption turned on so the model also sees
+# states it was knocked off the truth path into -- the failure mode ftcull4 hit,
+# where it was confidently wrong at a handful of states and the beam evicted the
+# truth path by step 2.
+#
+# ftgen1848_worker.sh is not used: it hardcodes SAILIR_TRUTHCULL_TRAIN to the
+# CLEAN corpus directory, which must not be overwritten. ab_worker.sh's TRAINDIR
+# does the same job and keeps the two corpora side by side.
+#
+# RATE 0.2 / 2-4, validated on the full 60-target cull study (cluster 1912908):
+#   57/60 solved, the SAME 3 failures as the uncorrupted study, and ZERO
+#   StopIteration across 36,123 corrupted steps -- i.e. the correct action never
+#   fell outside the culled top-1000, at scrambled states as well as truth ones.
+#   Cost 2.20x steps overall, 1.98x on the deepest quartile.
+# Each step consumes ONE closure row and each scramble injects N, so the walk is
+# bounded only while FRAC * mean(N) < 1; here 0.2 * 3 = 0.6. A 0.3/2-5 arm sat
+# at 1.05 and turned a 4-step target into 498 steps.
+environment = "METRIC=upstream SAILIR_CORRUPT_FRAC=0.2 SAILIR_CORRUPT_MIN=2 SAILIR_CORRUPT_MAX=4 SAILIR_CORRUPT_SEED=12345 OUTSUF=_corrupt1848_f0.2_2to4 TRAINDIR=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/ftdata1848_corrupt_f0.2_2to4"
+request_cpus = 1
+request_memory = 32GB
+request_disk = 4GB
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848_corrupt/$(Process).log
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848_corrupt/$(Process).out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848_corrupt/$(Process).err
+queue integral from /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/ft1848.txt

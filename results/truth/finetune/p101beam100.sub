@@ -1,0 +1,17 @@
+universe   = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/finetune/p101_beam_worker.sh
+arguments  = "$(t) $(mode) $(bw)"
+environment = "EXPDIR=p101beam100"
+
+# 4 GB/CORE (README 1.3b). The K=1000 prob40 baseline peaked at 10,583 MB, so
+# 12 GB needs 3 CPUs. Under-requesting here is what got jobs reaped and wedged
+# mount points on 2026-09-04.
+request_cpus   = 3
+request_memory = 12GB
+request_disk   = 4GB
+
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/finetune/p101beam100/logs/$(ClusterId)_$(Process).log
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/finetune/p101beam100/logs/$(ClusterId)_$(Process).out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/finetune/p101beam100/logs/$(ClusterId)_$(Process).err
+
+queue t,mode,bw from /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/finetune/p101_test100_jobs.txt

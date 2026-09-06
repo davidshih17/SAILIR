@@ -1,0 +1,21 @@
+universe   = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus/worker.sh
+arguments  = "$(integral)"
+
+# Same worker as run 1 (K=1000 truthcull recipe unchanged); only the closure
+# SOURCE and output tree differ, passed by env so the worker stays single-sourced.
+environment = "SAILIR_CLOSURE_DIR=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/closures/v5_p101_59k/out SAILIR_WALK_OUTDIR=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus_v2 SAILIR_MEM_CAP_MB=7600"
+
+# 4 GB PER CORE, HARD (README 1.3b/3.2b): request_cpus = ceil(mem / 4GB).
+# 8 GB -> 2 cpus. Measured walk max is 3,861 MB over 28,621 jobs, so 8 GB is ~2x
+# headroom. Run 1 used 10 GB / 1 cpu = 2.5x over policy; the OOM reaper kills
+# those and can wedge mount points for other users.
+request_cpus   = 2
+request_memory = 8GB
+request_disk   = 4GB
+
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus_v2/logs/$(ClusterId)_$(Process).log
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus_v2/logs/$(ClusterId)_$(Process).out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus_v2/logs/$(ClusterId)_$(Process).err
+
+queue integral from /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/p101_cull_corpus_v2/targets.txt

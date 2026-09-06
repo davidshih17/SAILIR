@@ -19,6 +19,7 @@ Output: JSONL file with one sample per reduction step.
 """
 
 import re
+import functools
 import random
 import json
 import argparse
@@ -77,6 +78,7 @@ def get_sector_id(integral):
     return sector_id
 
 
+@functools.lru_cache(maxsize=None)
 def get_sector_mask(sector_id):
     """Tuple of length N_DENOMINATORS: 1 at each denom slot present in sector_id.
 
@@ -146,11 +148,15 @@ def is_master_for_sector(integral, sector_id):
 
 
 def weight(integral):
-    """Compute weight for ordering integrals (higher weight = reduce first)."""
+    """Total weight. LARGER = HIGHER = reduce first: (r, s, tuple(-|a_i|)).
+    All three components run the same way, so max(key=weight) is the highest
+    integral and no call site needs a per-component sign fix. Mirrors
+    sailir.ibp_env.weight EXACTLY -- they are different function objects and any
+    divergence would be invisible at the call site."""
     return (
-        sum(max(0, x) for x in integral),
+        sum(x for x in integral if x > 0),
         -sum(min(0, x) for x in integral),
-        tuple(abs(x) for x in integral)
+        tuple(-abs(x) for x in integral)
     )
 
 
@@ -178,23 +184,44 @@ def solve_ibp_for(ibp, integral):
 
 
 def apply_substitution(expr, sub_int, sol):
-    if sub_int not in expr:
+    # 2026-08-04: was two FULL Python-level dictcomps per call (one to drop
+    # sub_int, one to strip zeros) — 1.6M calls in 39 recorder steps made
+    # those two comprehensions 7.3s of a 12.2s total. Now: one C-level
+    # dict() copy, and zero-stripping only on the keys `sol` actually
+    # touches (no other key's value can change, so no full rescan is
+    # needed). Memory-neutral — still exactly one new dict, no caches.
+    # Relies on the invariant "no stored value is 0 mod PRIME", which this
+    # function itself maintains (it never inserts a 0 and deletes any key
+    # that becomes 0); producers agree: get_raw_equation inserts only
+    # `if coeff:`, and solve_ibp_for's values are nonzero in a prime field.
+    coeff = expr.get(sub_int)
+    if coeff is None:
         return expr
-    coeff = expr[sub_int]
-    new_expr = {k: v for k, v in expr.items() if k != sub_int}
+    new_expr = dict(expr)
+    del new_expr[sub_int]
     for integral, sub_coeff in sol.items():
         new_coeff = (coeff * sub_coeff) % PRIME
-        if integral in new_expr:
-            new_expr[integral] = (new_expr[integral] + new_coeff) % PRIME
+        old = new_expr.get(integral)
+        if old is None:
+            if new_coeff:
+                new_expr[integral] = new_coeff
         else:
-            new_expr[integral] = new_coeff
-    return {k: v for k, v in new_expr.items() if v != 0}
+            v = (old + new_coeff) % PRIME
+            if v:
+                new_expr[integral] = v
+            else:
+                del new_expr[integral]
+    return new_expr
 
 
 def apply_all_substitutions(expr, subs):
+    # identical single-pass insertion-order semantics; entries absent from
+    # the (evolving) expression are skipped without a call (2026-08-01:
+    # 6M no-op apply_substitution calls dominated the truth-recorder profile)
     result = dict(expr)
     for sub_int, sol in subs.items():
-        result = apply_substitution(result, sub_int, sol)
+        if sub_int in result:
+            result = apply_substitution(result, sub_int, sol)
     return result
 
 
@@ -230,7 +257,19 @@ def parse_templates(path):
     return templates
 
 
+@functools.lru_cache(maxsize=2_000_000)
+def _eval_coeff_cached(coeff_str, seed):
+    return _evaluate_coefficient_impl(coeff_str, seed)
+
+
 def evaluate_coefficient(coeff_str, seed):
+    """Cached front (2026-08-01): coefficient evaluation is deterministic in
+    (coeff_str, seed); the string-eval + Fraction arithmetic dominated the
+    truth-recorder profile (795k evals / 15M Fractions per 16 steps)."""
+    return _eval_coeff_cached(coeff_str, tuple(seed))
+
+
+def _evaluate_coefficient_impl(coeff_str, seed):
     """Eval coefficient at finite-field point. Indices a0..a{N-1} from `seed`,
     plus topology kinematics (d + invariants) from KINEMATICS.
 
@@ -438,8 +477,50 @@ def scramble(start, ibp_t, li_t, num_ops, n_steps, sector_id,
 # Action enumeration
 # =============================================================================
 
+class EnumCache:
+    """Incremental cache of `apply_all_substitutions(raw(op,seed), subs)` for
+    enumerate_valid_actions' INDIRECT loop (2026-08-04).
+
+    Why it is correct: the cached value depends only on (op, seed) and on
+    `subs` — never on `target`. apply_all_substitutions is a SINGLE pass in
+    insertion order, and the recorder appends each new substitution LAST, so
+        one_pass(subs_k + [new]) == apply_substitution(one_pass(subs_k), new)
+    i.e. folding the new substitution into each cached entry is exactly a full
+    replay. Entries created later are built with a full replay against the
+    current subs, so both paths agree.
+
+    Why it is bounded: only the indirect loop is cached. Direct-loop seeds are
+    derived from `target`, which changes every step and is never revisited (an
+    integral is eliminated once), so those entries would be single-use — we do
+    not store them. Indirect seeds derive from sub_ints, which only accumulate,
+    so entries are reused every subsequent step.
+
+    Cost per step is one dict-membership test per stored entry (apply_substitution
+    returns the same object untouched when the key is absent), replacing a full
+    dict copy + multi-substitution replay per candidate action.
+    """
+
+    __slots__ = ('cu', 'hits', 'misses')
+
+    def __init__(self):
+        self.cu = {}
+        self.hits = 0
+        self.misses = 0
+
+    def add_sub(self, sub_int, sol):
+        """Fold one newly-appended substitution into every cached entry."""
+        cu = self.cu
+        for k, eq in cu.items():
+            if sub_int in eq:
+                cu[k] = apply_substitution(eq, sub_int, sol)
+
+    def stats(self):
+        return f"entries={len(self.cu)} hits={self.hits} misses={self.misses}"
+
+
 def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
-                           filter_higher=True, filter_lateral=False):
+                           filter_higher=True, filter_lateral=False,
+                           enum_cache=None):
     """
     Enumerate all valid (ibp_op, delta) pairs that can eliminate target.
     Returns list of (ibp_op, delta) where delta = seed - target.
@@ -484,7 +565,17 @@ def enumerate_valid_actions(target, subs, ibp_t, li_t, shifts, sector_id,
                     continue
                 if target in raw and raw[target] != 0:
                     continue
-                cached = apply_all_substitutions(raw, subs)
+                if enum_cache is None:
+                    cached = apply_all_substitutions(raw, subs)
+                else:
+                    _key = (ibp_op, seed)
+                    cached = enum_cache.cu.get(_key)
+                    if cached is None:
+                        cached = apply_all_substitutions(raw, subs)
+                        enum_cache.cu[_key] = cached
+                        enum_cache.misses += 1
+                    else:
+                        enum_cache.hits += 1
                 if target not in cached or cached[target] == 0:
                     continue
                 # Filter based on options
@@ -749,8 +840,7 @@ def main():
                         failure_reason = f"coeff_mismatch: final={final}, expected={expected_coeffs}"
                     break
 
-                target = sorted(non_masters.keys(),
-                    key=lambda x: (-weight(x)[0], -weight(x)[1], weight(x)[2]))[0]
+                target = max(non_masters.keys(), key=weight)
 
                 # Find the used_ibps action that works
                 found_action = None

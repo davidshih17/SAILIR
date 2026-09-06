@@ -1,0 +1,10 @@
+universe = vanilla
+executable = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/ftgen1848_worker.sh
+arguments = "$(integral)"
+request_cpus = 1
+request_memory = 32GB
+request_disk = 4GB
+log    = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848/$(Process).log
+output = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848/$(Process).out
+error  = /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/logs/ftgen1848/$(Process).err
+queue integral from /het/p4/dshih/jet_images-deep_learning/SAILIR_phase2/results/truth/truthcull/ft1848.txt
