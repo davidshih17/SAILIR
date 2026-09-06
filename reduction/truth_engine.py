@@ -33,7 +33,15 @@ Usage:
       [--dr 1 --ds 1]     seed caps: r(T)+dr, s(T)+ds per sector system
 """
 import os, sys, argparse, pickle, time
-ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
+# Repo root for the system CACHE (results/truth/systems). Same resolution as
+# topo_config.ROOT: SAILIR_ROOT > the production path if it exists on this box
+# > the repo this file lives in. Note SAILIR_NO_SYSTEM_CACHE=1 does NOT avoid
+# needing a writable root -- _sys_path() os.makedirs unconditionally, and
+# build_system calls it before the flag is ever consulted.
+_LEGACY_ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.environ.get('SAILIR_ROOT') or (
+    _LEGACY_ROOT if os.path.isdir(_LEGACY_ROOT) else _REPO_ROOT)
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
 
 from sailir import ibp_env
