@@ -1577,6 +1577,47 @@ _V9_CULL = os.environ.get('SAILIR_V9_CULL', '1') != '0'
 # truthminnew has NO action, so DAgger could not produce a label there.
 # 'used' is per-state and reconstructed from that state's own path, since each
 # beam state consumed a different set of rows.
+# ---- DAgger ROW EMITTER ---------------------------------------------------
+# SAILIR_DAGGER_OUT=<rows.jsonl>  emit training rows at states the MODEL
+#   actually visits, rather than at states a truthminnew walk visits. This is
+#   the DAgger step: the expert labels the learner's own state distribution.
+#
+# The label rule is IDENTICAL to the production recorder's. From
+# data-gen/preprocess_to_tensors.py: "valid_label_idxs: EVERY unused closure
+# row that solves this target, as indices into valid_actions. All of them are
+# correct actions, so 'label' is one arbitrary pick from this set." So the
+# expert here is exactly the corpus's expert, just queried off-path -- which is
+# sound because a closure is a SPANNING SET for the elimination, not a path
+# (measured: 0 exhaustions over ~1,240 beam states on 4 targets).
+#
+# SAILIR_DAGGER_MODE:
+#   errors (default) -- emit ONLY where the model's top-1 is NOT a correct
+#     action. truthminnew is WEAKER than the model where the model works (96-
+#     step truth walks vs the beam's 24), so imitating it everywhere would cap
+#     the learner at the worse policy. Labelling only the model's mistakes
+#     fixes recovery without overwriting good routing.
+#   all -- emit every state (classic DAgger aggregation).
+# SAILIR_DAGGER_DEADEND=1 -- also emit states where NO unused closure row is
+#   legal, with an EMPTY valid_label_idxs. Those are evidenced dead ends (the
+#   expert itself has no move), not merely unfamiliar states, so an all-zeros
+#   BCE target there is a fact rather than an assumption.
+_DAGGER_OUT = os.environ.get('SAILIR_DAGGER_OUT')
+_DAGGER_MODE = os.environ.get('SAILIR_DAGGER_MODE', 'errors')
+_DAGGER_DEADEND = os.environ.get('SAILIR_DAGGER_DEADEND') == '1'
+_DAGGER_FH = None
+_DAGGER_STATS = {'emitted': 0, 'skipped_model_right': 0, 'deadend': 0, 'seen': 0}
+if _DAGGER_OUT:
+    import atexit as _dax
+    def _dagger_summary():
+        st = _DAGGER_STATS
+        if st['seen']:
+            print(f"  [DAGGER] seen={st['seen']} emitted={st['emitted']} "
+                  f"skipped_model_already_right={st['skipped_model_right']} "
+                  f"deadend={st['deadend']} "
+                  f"model_error_rate={(st['emitted']+st['deadend'])/st['seen']:.3f}",
+                  flush=True)
+    _dax.register(_dagger_summary)
+
 _CLOSURE_PROBE = os.environ.get('SAILIR_CLOSURE_PROBE')
 _CLOSURE_PROBE_SET = None
 if _CLOSURE_PROBE:
@@ -2487,6 +2528,57 @@ def _select_actions(valid, target, aux_flat, max_actions, strategy):
     sel = np.argpartition(keys, max_actions)[:max_actions]
     sel.sort()                              # keep original order among the chosen
     return [valid[i] for i in sel]
+
+
+def _emit_dagger_rows(tasks, beam, probs, target_sector, step):
+    """Write one jsonl training row per model-visited state.
+
+    Schema matches data-gen/preprocess_to_tensors.py exactly so the existing
+    packer consumes these unchanged. `subs` is emitted EMPTY: the p=101 corpus
+    is packed without --keep-subs (the nosubs model ignores them), and the
+    packer's include_subs=False path drops the field anyway.
+    """
+    global _DAGGER_FH
+    import json as _dj
+    if _DAGGER_FH is None:
+        _DAGGER_FH = open(_DAGGER_OUT, 'a')
+    N = ibp_env.N_INDICES
+    for _ti, (_pi, _tgt, _valid) in enumerate(tasks):
+        st = beam[_pi]
+        _DAGGER_STATS['seen'] += 1
+        used = {(o, tuple(t[i] + d[i] for i in range(N))) for (t, o, d) in st.path}
+        lab = []
+        for _j, (o, d) in enumerate(_valid):
+            seed = tuple(_tgt[i] + d[i] for i in range(N))
+            if (o, seed) in _CLOSURE_PROBE_SET and (o, seed) not in used:
+                lab.append(_j)
+        if not lab:
+            _DAGGER_STATS['deadend'] += 1
+            if not _DAGGER_DEADEND:
+                continue
+        # model's own pick, to decide whether this state is a mistake
+        _top = int(probs[_ti, :len(_valid)].argmax()) if len(_valid) else -1
+        if _DAGGER_MODE == 'errors' and lab and _top in lab:
+            _DAGGER_STATS['skipped_model_right'] += 1
+            continue
+        row = {
+            'scramble_id': -1,
+            'sector_id': ibp_env.get_sector_id(_tgt),
+            'sector_mask': [int(x) for x in target_sector],
+            'step': step,
+            'target': [int(x) for x in _tgt],
+            'target_weight': [int(x) for x in ibp_env.weight(_tgt)[:2]],
+            'start_target': [int(x) for x in _tgt],
+            'expr': [[[int(x) for x in k], int(v)] for k, v in st.expr.items()],
+            'subs': [],
+            'valid_actions': [[int(o), [int(x) for x in d]] for (o, d) in _valid],
+            'num_valid_actions': len(_valid),
+            'chosen_action_idx': lab[0] if lab else 0,
+            'valid_label_idxs': lab,
+        }
+        _DAGGER_FH.write(_dj.dumps(row) + '\n')
+        _DAGGER_STATS['emitted'] += 1
+    _DAGGER_FH.flush()
 
 
 def beam_search_v5(env, model, start_expr, target_sector, start_w12,
@@ -3959,6 +4051,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     if (_o, _seed) in _CLOSURE_PROBE_SET and (_o, _seed) not in _used:
                         _c += 1
                 _avail.append(_c)
+            if _DAGGER_OUT is not None:
+                _emit_dagger_rows(tasks, beam, probs, target_sector, step)
             if _avail:
                 _z = sum(1 for a in _avail if a == 0)
                 print(f'  [CLOSUREPROBE] step={step} tasks={len(_avail)} '
