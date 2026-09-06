@@ -306,10 +306,17 @@ State_v5 = namedtuple(
     ['expr', 'resolved_subs',
      'score', 'path', 'n_non_masters',
      'max_w12', 'total_w12',  # cached sort keys, computed once at construction
-     'aux_flat'],  # (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
-                   # or None to mean "rebuild from scratch on use"
+     'aux_flat',  # (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+                  # or None to mean "rebuild from scratch on use"
+     'last_prob'],  # model prob of the action that CREATED this state, for
+                    # beam_sort='prob'. None on states not made by an action
+                    # (the root), which sort last.
 )
-State_v5.__new__.__defaults__ = (None, None, None)  # max_w12, total_w12, aux_flat defaults
+State_v5.__new__.__defaults__ = (None, None, None, None)  # max_w12, total_w12, aux_flat, last_prob
+
+# Weight of the n_non_masters regulariser in beam_sort='prob_nm'.
+# cost = _NM_LAMBDA * nm - log(prob). See sort_prob_nm for the scale argument.
+_NM_LAMBDA = float(os.environ.get('SAILIR_BEAM_NM_LAMBDA', '0.03'))
 
 
 # ============================================================================
@@ -658,6 +665,7 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
         max_w12=mw,
         total_w12=tw,
         aux_flat=None,
+        last_prob=action_prob,
     )
     return child, sol
 
@@ -1101,6 +1109,35 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
 
     def sort_totalweight(s):
         return (s.total_w12, s.n_non_masters, -s.score)
+
+    def sort_prob_nm(s):
+        # 'prob_nm': the model's current-step probability GUIDES, with an
+        # n_non_masters REGULARISER -- a single cost, not a lexicographic key:
+        #
+        #     cost = lambda * nm  -  log(prob)          (lower is better)
+        #
+        # Still no accumulated path score and no max_w12, so this isolates the
+        # effect of the nm term alone against plain 'prob'.
+        #
+        # SCALE, measured on the bce/sigmoid checkpoint over 200 states: the top
+        # action of every state scores ~0.9999 (whole range 0.967-1.000), so
+        # -log(prob) spans only ~0.033, while nm spans 1..18. Any lambda much
+        # above ~0.002 therefore makes nm strictly dominant and the sort
+        # degenerates to lexicographic-by-nm. The default below is chosen so one
+        # extra non-master costs about as much as the FULL observed spread of
+        # top-action confidence -- i.e. an exceptionally confident action can
+        # just offset one extra non-master, and no more. Tune with
+        # SAILIR_BEAM_NM_LAMBDA.
+        p = s.last_prob if s.last_prob is not None else 1e-12
+        return _NM_LAMBDA * s.n_non_masters - math.log(max(p, 1e-12))
+
+    def sort_prob(s):
+        # beam_sort='prob': rank ONLY by the model's probability for the action
+        # that produced this state. Deliberately drops both of the other terms
+        # in sort_weight: no max_w12/n_non_masters progress regulariser, and no
+        # accumulated path score -- so nothing carries over between steps and
+        # the frontier is whatever looks most confident right now.
+        return (-(s.last_prob if s.last_prob is not None else -1.0),)
 
     # Hoist memprobe config out of the per-step loop. Per-step we want at
     # most a set-membership check or an integer modulo — no env-var parsing.
@@ -2054,6 +2091,22 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             probs_all[chunk_start:chunk_start + len(chunk), :cn] = chunk_probs
             del b, chunk_probs
         probs = probs_all
+        # OFF-MANIFOLD CONFIDENCE PROBE (SAILIR_CONF_PROBE=1). Logs the model's
+        # top score per (parent,target) task BEFORE beam selection, so it is not
+        # biased by the sort picking confident states. Training states are all
+        # on a valid reduction path; beam states after step ~1 are not. Compare
+        # these against the on-manifold baseline measured on val states.
+        if os.environ.get('SAILIR_CONF_PROBE') == '1':
+            with torch.no_grad():
+                _pm = probs.max(dim=1).values.tolist()
+            if _pm:
+                _sm = sorted(_pm)
+                _n = len(_sm)
+                print(f'  [CONFPROBE] step={step} n_tasks={_n} '
+                      f'max={_sm[-1]:.6f} p90={_sm[int(0.9*(_n-1))]:.6f} '
+                      f'median={_sm[_n//2]:.6f} p10={_sm[int(0.1*(_n-1))]:.6f} '
+                      f'min={_sm[0]:.6f} '
+                      f'frac>0.99={sum(v>0.99 for v in _sm)/_n:.3f}', flush=True)
         if _v5_prof:
             _p2['model_fwd'] += time.time() - _t
 
@@ -2178,6 +2231,12 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     seen.add(cid)
                     new_beam.append(c)
             beam = new_beam
+        elif beam_sort == 'prob':
+            candidates.sort(key=sort_prob)
+            beam = candidates[:beam_width]
+        elif beam_sort == 'prob_nm':
+            candidates.sort(key=sort_prob_nm)
+            beam = candidates[:beam_width]
         else:
             raise ValueError(f'unknown beam_sort {beam_sort}')
 
@@ -2760,12 +2819,33 @@ def main():
     # prime is REQUIRED (no default since the 2026-07-15 bug fix): take it from
     # the checkpoint's own training args, falling back to the CLI prime.
     ck = torch.load(args.model, map_location='cpu', weights_only=False)
-    model = IBPActionClassifier(
-        prime=(ck.get('args') or {}).get('prime', args.prime),
+    _cka = ck.get('args') or {}
+    # Pick the class the checkpoint was TRAINED with. Defaults to the historical
+    # IBPActionClassifier so every pre-existing checkpoint loads exactly as before;
+    # a 'nosubs' checkpoint has no subs_enc.* keys and would fail load_state_dict
+    # against the full class.
+    _variant = _cka.get('model_variant', 'full')
+    # score_activation decides forward()'s SECOND return value, which is what
+    # this beam consumes as action_prob. 'sigmoid' for bce-trained models --
+    # softmax would divide by sum_j exp(z_j) over the action set and reimpose
+    # the action-count dependence those models are trained without.
+    _act = _cka.get('score_activation', 'softmax')
+    _mkw = dict(
+        prime=_cka.get('prime', args.prime),
         n_indices=topology.n_indices,
         n_denominators=topology.n_denominators,
         n_ibp_ops=topology.n_actions,
     )
+    for _k in ('embed_dim', 'n_heads', 'n_expr_layers', 'n_cross_layers'):
+        if _k in _cka:
+            _mkw[_k] = _cka[_k]
+    if _variant == 'nosubs':
+        from sailir.classifier_nosubs import IBPActionClassifierNoSubs
+        model = IBPActionClassifierNoSubs(score_activation=_act, **_mkw)
+    else:
+        model = IBPActionClassifier(**_mkw)
+    print(f'  model_variant = {_variant}  score_activation = {_act}  '
+          f'prime = {_mkw["prime"]}', flush=True)
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
     if _memprobe_mod is not None:

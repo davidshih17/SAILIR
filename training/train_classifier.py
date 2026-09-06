@@ -146,9 +146,10 @@ def make_collate_fn(n_indices, n_denominators):
 # objective. Read once at import, not per batch.
 _SET_LOSS = os.environ.get('SAILIR_LOSS', 'ce') == 'set'
 _SOFT_LOSS = os.environ.get('SAILIR_LOSS', 'ce') == 'soft'
-if os.environ.get('SAILIR_LOSS', 'ce') not in ('ce', 'set', 'soft'):
+_BCE_LOSS = os.environ.get('SAILIR_LOSS', 'ce') == 'bce'
+if os.environ.get('SAILIR_LOSS', 'ce') not in ('ce', 'set', 'soft', 'bce'):
     raise SystemExit(f"unknown SAILIR_LOSS={os.environ['SAILIR_LOSS']!r} "
-                     f"(ce | set | soft)")
+                     f"(ce | set | soft | bce)")
 
 
 def _action_loss(logits, batch):
@@ -208,6 +209,46 @@ def _action_loss(logits, batch):
         logp = F.log_softmax(logits, dim=-1)
         contrib = torch.where(soft > 0, soft * logp, torch.zeros_like(logp))
         return -contrib.sum(dim=-1).mean()
+    if _BCE_LOSS:
+        # INDEPENDENT PER-ACTION BCE: every valid action -> 1, every other -> 0.
+        # Unlike softmax the outputs are uncoupled, so the model can be
+        # confident on ALL ~n_pos correct actions at once instead of having to
+        # split one unit of probability mass between them.
+        #
+        # DOUBLY NORMALISED, so the objective does not depend on how many
+        # actions a state happens to offer:
+        #   mean within positives  -> independent of n_pos
+        #   mean within negatives  -> independent of n_neg
+        #   equal 1/2 on each side -> independent of their RATIO. This is a
+        #     PER-STATE pos_weight = n_neg_i/n_pos_i. A single global
+        #     pos_weight is wrong almost everywhere: measured on this corpus
+        #     the per-state ratio spans ~11:1 to ~999:1 around a 109:1 mean
+        #     (training/measure_label_imbalance.py).
+        #   mean over states       -> independent of state size (74..1000 here)
+        #
+        # NaN TRAP -- the same one the soft loss records hitting on its first
+        # run. The scorer returns logits.masked_fill(~action_mask, -inf)
+        # (classifier.py:415) and BCEWithLogits computes -x*target, so on a
+        # padded slot -(-inf)*0 = nan. Substitute a finite value BEFORE the
+        # BCE; nan_to_num afterwards would still poison the backward pass.
+        act = batch['action_mask']
+        pos = batch['label_mask'] & act
+        neg = (~batch['label_mask']) & act
+        safe = torch.where(act, logits, torch.zeros_like(logits))
+        l_pos = F.binary_cross_entropy_with_logits(
+            safe, torch.ones_like(safe), reduction='none')
+        l_neg = F.binary_cross_entropy_with_logits(
+            safe, torch.zeros_like(safe), reduction='none')
+        n_pos = pos.sum(dim=1)
+        n_neg = neg.sum(dim=1)
+        mean_pos = (l_pos * pos).sum(dim=1) / n_pos.clamp(min=1)
+        mean_neg = (l_neg * neg).sum(dim=1) / n_neg.clamp(min=1)
+        # A state with no positives (or no negatives) contributes only the side
+        # it actually has, rather than averaging in a spurious 0.
+        w_pos = (n_pos > 0).to(logits.dtype)
+        w_neg = (n_neg > 0).to(logits.dtype)
+        per_state = (w_pos * mean_pos + w_neg * mean_neg) / (w_pos + w_neg).clamp(min=1)
+        return per_state.mean()
     if not _SET_LOSS:
         return F.cross_entropy(logits, batch['labels'])
     mask = batch['label_mask']
@@ -457,12 +498,56 @@ def evaluate(model, dataloader, device, max_iters=None):
     # children per expansion. Normalised by min(K, |C|) so a state with only 3
     # correct actions can still score 1.0 rather than being capped at 3/20.
     total_cov20 = 0.0
+    # CONFIDENCE metrics. Everything above is rank-based; none of it answers
+    # "is the model CONFIDENT that some correct action is correct". Under a bce
+    # objective that is the question -- the model is asked to put ~1 on every
+    # valid action and ~0 on the rest, and a rank metric cannot see whether it
+    # did. Read from the SAME activation the model exposes to the beam.
+    total_conf_best_cor = 0.0    # max sigma over CORRECT   -> should rise to 1
+    total_conf_mean_cor = 0.0    # mean sigma over CORRECT  -> "confident on ALL valid"
+    total_conf_max_inc = 0.0     # max sigma over INCORRECT -> should fall to 0
+    total_conf_margin = 0.0      # best correct minus worst incorrect
+    total_nconf_cor = 0.0        # count of CORRECT   with sigma > 0.5
+    total_nconf_inc = 0.0        # count of INCORRECT with sigma > 0.5
+    # RATE form of "confident on ANY correct action". The mean of max-sigma can
+    # hide its distribution: 0.70 could be 0.70 everywhere, or 1.0 on 70% of
+    # states and 0.0 on the rest. These count STATES where at least one correct
+    # action clears the bar, which is the yes/no question the beam faces.
+    total_any50 = 0.0
+    total_any90 = 0.0
+
+    _m = model.module if hasattr(model, 'module') else model
+    _use_sigmoid = getattr(_m, 'score_activation', 'softmax') == 'sigmoid'
 
     for batch_idx, batch in _ddp_synced_batches(dataloader, device, max_iters):
         batch = {k: v.to(device) for k, v in batch.items()}
         logits, _ = model_forward(model, batch)
         loss = _action_loss(logits, batch)
         bs = batch['labels'].size(0)
+
+        # --- confidence ---
+        _act = batch['action_mask']
+        _cor = batch['label_mask'] & _act
+        _inc = (~batch['label_mask']) & _act
+        # Padding carries -inf; sigmoid/softmax both send it to 0, and we mask
+        # anyway, so no special handling is needed beyond avoiding empty sets.
+        _sc = (torch.sigmoid(logits) if _use_sigmoid
+               else torch.softmax(logits, dim=-1))
+        _neg1 = torch.full_like(_sc, -1.0)
+        _best_cor = torch.where(_cor, _sc, _neg1).max(dim=1).values
+        _max_inc = torch.where(_inc, _sc, _neg1).max(dim=1).values
+        _has_cor = _cor.any(dim=1)
+        _has_inc = _inc.any(dim=1)
+        _ncor = _cor.sum(dim=1).clamp(min=1)
+        _mean_cor = (_sc * _cor).sum(dim=1) / _ncor
+        total_conf_best_cor += _best_cor[_has_cor].sum().item()
+        total_conf_mean_cor += _mean_cor[_has_cor].sum().item()
+        total_conf_max_inc += _max_inc[_has_inc].sum().item()
+        total_conf_margin += (_best_cor - _max_inc)[_has_cor & _has_inc].sum().item()
+        total_nconf_cor += ((_sc > 0.5) & _cor).sum(dim=1).float().sum().item()
+        total_nconf_inc += ((_sc > 0.5) & _inc).sum(dim=1).float().sum().item()
+        total_any50 += (_best_cor[_has_cor] > 0.5).float().sum().item()
+        total_any90 += (_best_cor[_has_cor] > 0.9).float().sum().item()
         # THE METRIC THAT MATCHES THE SEARCH. top1/top5/top20 below all score
         # against ONE designated action out of ~18 equally correct ones, so they
         # measure conformity to a convention. What the beam needs is simply that
@@ -503,6 +588,14 @@ def evaluate(model, dataloader, device, max_iters=None):
         'anyhit_sum': total_anyhit,
         'anyhit20_sum': total_anyhit20,
         'cov20_sum': total_cov20,
+        'conf_best_cor_sum': total_conf_best_cor,
+        'conf_mean_cor_sum': total_conf_mean_cor,
+        'conf_max_inc_sum': total_conf_max_inc,
+        'conf_margin_sum': total_conf_margin,
+        'nconf_cor_sum': total_nconf_cor,
+        'nconf_inc_sum': total_nconf_inc,
+        'any50_sum': total_any50,
+        'any90_sum': total_any90,
         'n_samples': total_samples,
     }
 
@@ -530,6 +623,7 @@ def main():
     parser.add_argument('--select_on', type=str, default='val_loss',
                         choices=['val_loss', 'val_top20', 'val_top1',
                                  'val_anyhit', 'val_anyhit20',
+                                 'conf_margin', 'conf_max_incorrect',
                                  'extra_top20', 'extra_top1',
                                  'dots_top20', 'dots_top1'],
                         help='Metric that decides best_model.pt. Default '
@@ -648,6 +742,13 @@ def main():
                              'Overrides --resume when both are set and last.pt exists.')
     parser.add_argument('--checkpoint_every', type=int, default=5,
                         help='Also save a numbered checkpoint every N epochs (in addition to last.pt).')
+    parser.add_argument('--restart_lr', type=float, default=0.0,
+                        help='On resume, FORCE the LR to this value and reset the '
+                             'scheduler state. Without it a resume restores the '
+                             'decayed LR and the scheduler\'s accumulated "best", '
+                             'so a run that has already annealed cannot be revived '
+                             '-- and if --select_on changed, the restored "best" '
+                             'refers to a different metric entirely.')
     parser.add_argument('--log_every', type=int, default=1,
                         help='Print per-batch metrics every N batches (1 = every batch).')
     args = parser.parse_args()
@@ -957,6 +1058,18 @@ def main():
         del _probe
 
     model_cls = MODEL_CLASSES[args.model_variant]
+    # A bce-trained model MUST expose sigmoid scores, not softmax: the beam
+    # consumes forward()'s second value as action_prob, and softmax divides by
+    # sum_j exp(z_j) over the action set -- reintroducing at inference the very
+    # action-count dependence the bce objective removes during training.
+    # Recorded into args (hence into every checkpoint) so the beam can rebuild
+    # the model the same way.
+    args.score_activation = 'sigmoid' if _BCE_LOSS else 'softmax'
+    if _BCE_LOSS and args.model_variant != 'nosubs':
+        raise SystemExit(
+            f"SAILIR_LOSS=bce needs score_activation support, which is "
+            f"implemented on 'nosubs' only; got --model_variant "
+            f"{args.model_variant!r}.")
     model = model_cls(
         embed_dim=args.embed_dim, n_heads=args.n_heads,
         n_expr_layers=args.n_expr_layers, n_cross_layers=args.n_cross_layers,
@@ -964,9 +1077,12 @@ def main():
         n_indices=n_indices, n_denominators=n_denominators, n_ibp_ops=n_actions,
         **({'use_start_target': True} if args.use_start_target else {}),
         **({'use_value_head': True} if args.use_value_head else {}),
+        **({'score_activation': 'sigmoid'} if _BCE_LOSS else {}),
     )
     model = model.to(device)
     log(f"Model variant: {args.model_variant} ({model_cls.__name__})")
+    log(f"Loss: {os.environ.get('SAILIR_LOSS', 'ce')}  "
+        f"score_activation: {args.score_activation}")
     log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     if args.freeze:
@@ -1095,7 +1211,7 @@ def main():
             optimizer, mode='min', factor=args.plateau_factor,
             patience=args.plateau_patience, threshold=args.plateau_threshold,
             threshold_mode='rel', min_lr=args.plateau_min_lr)
-        log(f"LR schedule: ReduceLROnPlateau(val_loss) factor={args.plateau_factor} "
+        log(f"LR schedule: ReduceLROnPlateau({args.select_on}) factor={args.plateau_factor} "
             f"patience={args.plateau_patience} threshold={args.plateau_threshold} "
             f"min_lr={args.plateau_min_lr}")
     else:
@@ -1189,6 +1305,31 @@ def main():
         best_val_loss = ckpt.get('best_val_loss', ckpt['val_metrics']['loss'])
         log(f"Resumed from epoch {start_epoch-1}, best_val_loss={best_val_loss:.4f}")
 
+        # A checkpoint's best_val_loss is in the units of the --select_on it was
+        # trained with. Resuming with a DIFFERENT --select_on would compare
+        # incomparable numbers and could freeze best_model.pt forever, so reset.
+        _ck_sel = (ckpt.get('args') or {}).get('select_on', 'val_loss')
+        if _ck_sel != args.select_on:
+            log(f"  --select_on changed ({_ck_sel} -> {args.select_on}): "
+                f"resetting best score (the stored one is in the old metric's units)")
+            best_val_loss = float('inf')
+
+        if args.restart_lr > 0:
+            # Force the LR back up and wipe the scheduler's history. Without
+            # this a resumed run keeps the annealed LR (and, for plateau, a
+            # 'best' accumulated under the old metric), so it cannot recover.
+            for g in optimizer.param_groups:
+                g['lr'] = args.restart_lr
+            if args.lr_schedule == 'plateau':
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode='min', factor=args.plateau_factor,
+                    patience=args.plateau_patience, threshold=args.plateau_threshold,
+                    threshold_mode='rel', min_lr=args.plateau_min_lr)
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=args.epochs, eta_min=args.lr/10)
+            log(f"  --restart_lr: LR forced to {args.restart_lr:.2e}, scheduler reset")
+
     # Per-epoch metrics log — only rank 0 writes.
     log_fp = None
     if args.log_file and is_main:
@@ -1196,7 +1337,11 @@ def main():
         if log_fp.tell() == 0:
             log_fp.write("epoch\ttrain_loss\ttrain_top1\ttrain_top5\tval_loss\tval_top1\tval_top5"
                          "\textra_loss\textra_top1\textra_top5"
-                         "\tval_top20\textra_top20\tval_anyhit\tval_anyhit20\tlr\twall_s\n")
+                         "\tval_top20\textra_top20\tval_anyhit\tval_anyhit20"
+                         "\tval_cov20\tconf_best_correct\tconf_mean_correct"
+                         "\tconf_max_incorrect\tconf_margin"
+                         "\tn_conf_correct\tn_conf_incorrect"
+                         "\tconf_any50\tconf_any90\tlr\twall_s\n")
             log_fp.flush()
 
     def aggregate_metrics(raw):
@@ -1215,20 +1360,71 @@ def main():
         anyhit_sum = raw.get('anyhit_sum', 0)
         anyhit20_sum = raw.get('anyhit20_sum', 0)
         cov20_sum = raw.get('cov20_sum', 0.0)
+        cbc = raw.get('conf_best_cor_sum', 0.0)
+        cmc = raw.get('conf_mean_cor_sum', 0.0)
+        cmi = raw.get('conf_max_inc_sum', 0.0)
+        cmg = raw.get('conf_margin_sum', 0.0)
+        ncc = raw.get('nconf_cor_sum', 0.0)
+        nci = raw.get('nconf_inc_sum', 0.0)
+        a50 = raw.get('any50_sum', 0.0)
+        a90 = raw.get('any90_sum', 0.0)
         n = raw['n_samples']
         if ddp_enabled:
             t = torch.tensor([loss_sum, top1_sum, top5_sum, top20_sum,
-                              anyhit_sum, anyhit20_sum, cov20_sum, n],
+                              anyhit_sum, anyhit20_sum, cov20_sum,
+                              cbc, cmc, cmi, cmg, ncc, nci, a50, a90, n],
                              device=device, dtype=torch.float64)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             (loss_sum, top1_sum, top5_sum, top20_sum,
-             anyhit_sum, anyhit20_sum, cov20_sum, n) = t.tolist()
+             anyhit_sum, anyhit20_sum, cov20_sum,
+             cbc, cmc, cmi, cmg, ncc, nci, a50, a90, n) = t.tolist()
         n = max(int(n), 1)
         return {'loss': loss_sum / n, 'cov20': cov20_sum / n,
                 'top1_acc': top1_sum / n,
                 'top5_acc': top5_sum / n, 'top20_acc': top20_sum / n,
                 'anyhit_acc': anyhit_sum / n,
-                'anyhit20_acc': anyhit20_sum / n}
+                'anyhit20_acc': anyhit20_sum / n,
+                'conf_best_correct': cbc / n, 'conf_mean_correct': cmc / n,
+                'conf_max_incorrect': cmi / n, 'conf_margin': cmg / n,
+                'n_conf_correct': ncc / n, 'n_conf_incorrect': nci / n,
+                'conf_any50': a50 / n, 'conf_any90': a90 / n}
+
+    def selection_score(val_m, dots_m):
+        """The --select_on metric, always as lower-is-better.
+
+        Drives best_model.pt AND (for --lr_schedule plateau) the LR cuts, so a
+        run anneals on the same quantity it is judged by. conf_margin /
+        conf_max_incorrect matter here because on this corpus val_loss goes
+        NOISY-FLAT long before the separation metrics stop improving (measured:
+        anyhit flat 0.9597-0.9612 from E24 while conf_margin kept rising to a
+        run-best +0.5160 at E30), so selecting or annealing on val_loss stops
+        responding to real progress.
+        """
+        so = args.select_on
+        if so == 'val_loss':
+            return val_m['loss']
+        if so == 'val_top20':
+            return -val_m.get('top20_acc', 0.0)
+        if so == 'val_top1':
+            return -val_m['top1_acc']
+        if so == 'val_anyhit20':
+            # any correct action inside the top-K=20 the beam expands
+            return -val_m.get('anyhit20_acc', 0.0)
+        if so == 'val_anyhit':
+            # "top-1 is A reducing action", not agreement with the one
+            # arbitrarily-recorded pick
+            return -val_m.get('anyhit_acc', 0.0)
+        if so == 'conf_margin':
+            # best-correct score minus best-incorrect score. Higher is better.
+            return -val_m.get('conf_margin', 0.0)
+        if so == 'conf_max_incorrect':
+            # confidence on the best WRONG action. Lower is better already.
+            return val_m.get('conf_max_incorrect', 1.0)
+        if so in ('extra_top20', 'dots_top20'):
+            return -(dots_m or val_m).get('top20_acc', 0.0)
+        if so in ('extra_top1', 'dots_top1'):
+            return -(dots_m or val_m)['top1_acc']
+        raise ValueError(f'unhandled --select_on {so!r}')
 
     log("\nStarting training...")
     log("=" * 70)
@@ -1258,8 +1454,12 @@ def main():
         val_m = aggregate_metrics(val_raw)
         dots_m = aggregate_metrics(dots_raw) if dots_raw is not None else None
 
+        # ONE score drives BOTH checkpoint selection and the plateau scheduler,
+        # so they can never disagree about what "better" means. Always
+        # lower-is-better (accuracy-style metrics are negated).
+        _score = selection_score(val_m, dots_m)
         if args.lr_schedule == 'plateau':
-            scheduler.step(val_m['loss'])
+            scheduler.step(_score)
         else:
             scheduler.step()
 
@@ -1269,6 +1469,22 @@ def main():
         log(f"  Train: loss={train_m['loss']:.4f}, top1={train_m['top1_acc']:.4f}, top5={train_m['top5_acc']:.4f}")
         log(f"  Val:   loss={val_m['loss']:.4f}, top1={val_m['top1_acc']:.4f}, "
             f"top5={val_m['top5_acc']:.4f}, TOP20={val_m.get('top20_acc', 0):.4f}")
+        # anyhit/cov20 score against the FULL valid set, so they stay meaningful
+        # when the objective does not target the one recorded label. conf_* are
+        # the only metrics that see CONFIDENCE rather than rank.
+        log(f"  Any:   anyhit={val_m.get('anyhit_acc', 0):.4f}, "
+            f"anyhit20={val_m.get('anyhit20_acc', 0):.4f}, "
+            f"cov20={val_m.get('cov20', 0):.4f}")
+        # ANY-correct confidence is the headline: the beam only needs ONE
+        # correct action to be ranked and trusted, never all of them.
+        log(f"  ANY:   conf_best_correct={val_m.get('conf_best_correct', 0):.4f}  "
+            f"[>0.5 in {val_m.get('conf_any50', 0):.1%} of states, "
+            f">0.9 in {val_m.get('conf_any90', 0):.1%}]")
+        log(f"  Conf:  max_incorrect={val_m.get('conf_max_incorrect', 0):.4f}, "
+            f"margin={val_m.get('conf_margin', 0):+.4f}, "
+            f"mean_correct(ALL, fyi)={val_m.get('conf_mean_correct', 0):.4f}")
+        log(f"         n>0.5: correct={val_m.get('n_conf_correct', 0):.2f}, "
+            f"incorrect={val_m.get('n_conf_incorrect', 0):.2f}")
         if dots_m is not None:
             log(f"  Extra[{os.path.basename(args.extra_val)}]: "
                 f"loss={dots_m['loss']:.4f}, top1={dots_m['top1_acc']:.4f}, "
@@ -1277,27 +1493,6 @@ def main():
         # Selection metric. best_val_loss holds the score being tracked; for
         # accuracy-style criteria we store the NEGATIVE so "lower is better"
         # stays uniform (and stays compatible with resumed checkpoints).
-        if args.select_on == 'val_loss':
-            _score = val_m['loss']
-        elif args.select_on == 'val_top20':
-            _score = -val_m.get('top20_acc', 0.0)
-        elif args.select_on == 'val_top1':
-            _score = -val_m['top1_acc']
-        elif args.select_on == 'val_anyhit20':
-            # THE deployment metric: any correct action inside the top-K=20 the
-            # beam actually expands. anyhit (K=1) is a proxy for it.
-            _score = -val_m.get('anyhit20_acc', 0.0)
-        elif args.select_on == 'val_anyhit':
-            # Select on "top-1 is A reducing action", not on agreement with the
-            # ONE arbitrarily-recorded pick out of ~24 equally correct ones.
-            # Measured at epoch 1 of the multi-label run: anyhit 0.891 while
-            # top1 was 0.117 -- selecting on top1/top20 would rank checkpoints
-            # by conformity to a convention the set loss deliberately ignores.
-            _score = -val_m.get('anyhit_acc', 0.0)
-        elif args.select_on in ('extra_top20', 'dots_top20'):
-            _score = -(dots_m or val_m).get('top20_acc', 0.0)
-        elif args.select_on in ('extra_top1', 'dots_top1'):
-            _score = -(dots_m or val_m)['top1_acc']
         is_best = _score < best_val_loss
         if is_best:
             best_val_loss = _score
@@ -1329,6 +1524,15 @@ def main():
                 # every earlier epochs.tsv stays parseable by the same scripts
                 _d += f"\t{val_m.get('anyhit_acc', 0):.6f}"
                 _d += f"\t{val_m.get('anyhit20_acc', 0):.6f}"
+                _d += f"\t{val_m.get('cov20', 0):.6f}"
+                _d += f"\t{val_m.get('conf_best_correct', 0):.6f}"
+                _d += f"\t{val_m.get('conf_mean_correct', 0):.6f}"
+                _d += f"\t{val_m.get('conf_max_incorrect', 0):.6f}"
+                _d += f"\t{val_m.get('conf_margin', 0):.6f}"
+                _d += f"\t{val_m.get('n_conf_correct', 0):.6f}"
+                _d += f"\t{val_m.get('n_conf_incorrect', 0):.6f}"
+                _d += f"\t{val_m.get('conf_any50', 0):.6f}"
+                _d += f"\t{val_m.get('conf_any90', 0):.6f}"
                 log_fp.write(f"{epoch}\t{train_m['loss']:.6f}\t{train_m['top1_acc']:.6f}\t{train_m['top5_acc']:.6f}"
                              f"\t{val_m['loss']:.6f}\t{val_m['top1_acc']:.6f}\t{val_m['top5_acc']:.6f}"
                              f"{_d}\t{cur_lr:.6e}\t{wall:.1f}\n")

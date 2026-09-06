@@ -61,9 +61,28 @@ class IBPActionClassifierNoSubs(nn.Module):
 
     def __init__(self, embed_dim=256, n_heads=4, n_expr_layers=2, n_cross_layers=2,
                  n_subs_layers=2, *, prime, n_indices=7, n_denominators=6,
-                 n_ibp_ops=9, use_start_target=False, use_value_head=False, **kwargs):
+                 n_ibp_ops=9, use_start_target=False, use_value_head=False,
+                 score_activation='softmax', **kwargs):
         super().__init__()
         self.prime = prime
+        # How forward()'s SECOND return value is produced -- the beam consumes
+        # it as `action_prob` and accumulates log(prob) into the path score.
+        #   'softmax'  : the historical behaviour. DEFAULT, so every existing
+        #                checkpoint and the whole current beam path are
+        #                bit-identical.
+        #   'sigmoid'  : for models trained with SAILIR_LOSS=bce. Required for
+        #                those, because softmax divides by sum_j exp(z_j) over
+        #                the action set and so reintroduces at INFERENCE exactly
+        #                the action-count dependence the BCE objective removes
+        #                during training. NOTE the returned values then no
+        #                longer sum to 1, so state.score stops being a
+        #                log-likelihood and becomes a sum of independent log
+        #                confidences -- comparable within a model, NOT across a
+        #                bce model and a ce model.
+        if score_activation not in ('softmax', 'sigmoid'):
+            raise ValueError(f'score_activation must be softmax|sigmoid, '
+                             f'got {score_activation!r}')
+        self.score_activation = score_activation
         self.embed_dim = embed_dim
         self.n_indices = n_indices
         self.n_denominators = n_denominators
@@ -154,8 +173,16 @@ class IBPActionClassifierNoSubs(nn.Module):
         if self.use_value_head:
             # 3-tuple ONLY when the head is enabled, so every existing caller
             # doing `logits, _ = model(...)` keeps working untouched.
-            return logits, F.softmax(logits, dim=-1), self.value_head(state_emb).squeeze(-1)
-        return logits, F.softmax(logits, dim=-1)
+            return logits, self._scores(logits), self.value_head(state_emb).squeeze(-1)
+        return logits, self._scores(logits)
+
+    def _scores(self, logits):
+        """Second return value: per-action scores for the beam."""
+        if self.score_activation == 'sigmoid':
+            # Padded slots carry -inf, and sigmoid(-inf) = 0, matching what
+            # softmax gives them. No masking needed.
+            return torch.sigmoid(logits)
+        return F.softmax(logits, dim=-1)
 
     def predict(self, *args, **kwargs):
         logits, _ = self.forward(*args, **kwargs)

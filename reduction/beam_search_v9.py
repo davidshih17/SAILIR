@@ -1566,6 +1566,28 @@ def _metric_arrays(reg):
 _V9_CULL = os.environ.get('SAILIR_V9_CULL', '1') != '0'
 
 
+# ---- CLOSURE-COVERAGE PROBE (DAgger feasibility) --------------------------
+# SAILIR_CLOSURE_PROBE=<closure.json> loads a target's truth closure and, at
+# every beam state, counts how many of that state's LEGAL actions are UNUSED
+# CLOSURE ROWS -- exactly the truthminnew availability condition
+# (beam_search_truthcull.py: "keep only UNUSED CLOSURE rows -> take the best").
+#
+# The question it answers: when the model deviates from the truth path, can the
+# expert still label the state? A task with zero available rows is one where
+# truthminnew has NO action, so DAgger could not produce a label there.
+# 'used' is per-state and reconstructed from that state's own path, since each
+# beam state consumed a different set of rows.
+_CLOSURE_PROBE = os.environ.get('SAILIR_CLOSURE_PROBE')
+_CLOSURE_PROBE_SET = None
+if _CLOSURE_PROBE:
+    import json as _clj
+    with open(_CLOSURE_PROBE) as _clf:
+        _CLOSURE_PROBE_SET = {(int(_o), tuple(_sd))
+                              for _o, _sd in _clj.load(_clf)['closure']}
+    print(f'  [CLOSUREPROBE] loaded {len(_CLOSURE_PROBE_SET)} closure rows '
+          f'from {_CLOSURE_PROBE}', flush=True)
+
+
 # Cache keyed on the STORE OBJECT, not the step. _v9_cull runs once per
 # (state, target) TASK, and _rs_as_dict materialises every PackedEq in the store
 # into a Python dict -- so at beam 40 the uncached version rebuilt the whole
@@ -3924,6 +3946,42 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             probs_all[chunk_start:chunk_start + len(chunk), :cn] = chunk_probs
             del b, chunk_probs
         probs = probs_all
+        if _CLOSURE_PROBE_SET is not None:
+            _N = ibp_env.N_INDICES
+            _avail = []
+            for _pi, _tgt, _valid in tasks:
+                _st = beam[_pi]
+                _used = {(_o, tuple(_t[i] + _d[i] for i in range(_N)))
+                         for (_t, _o, _d) in _st.path}
+                _c = 0
+                for (_o, _d) in _valid:
+                    _seed = tuple(_tgt[i] + _d[i] for i in range(_N))
+                    if (_o, _seed) in _CLOSURE_PROBE_SET and (_o, _seed) not in _used:
+                        _c += 1
+                _avail.append(_c)
+            if _avail:
+                _z = sum(1 for a in _avail if a == 0)
+                print(f'  [CLOSUREPROBE] step={step} tasks={len(_avail)} '
+                      f'expert_can_label={len(_avail)-_z} exhausted={_z} '
+                      f'frac_labelable={(len(_avail)-_z)/len(_avail):.3f} '
+                      f'mean_avail_rows={sum(_avail)/len(_avail):.1f} '
+                      f'max_avail={max(_avail)}', flush=True)
+        # OFF-MANIFOLD CONFIDENCE PROBE (SAILIR_CONF_PROBE=1). Top model score
+        # per (parent,target) task, logged BEFORE beam selection so the sort
+        # cannot bias the sample. Training states all lie on a truth reduction
+        # path; beam states past step ~1 do not. v9 applies the same fastmaxw
+        # cull the corpus was generated with, so these scores are directly
+        # comparable to on-manifold scores measured on val states.
+        if os.environ.get('SAILIR_CONF_PROBE') == '1':
+            with torch.no_grad():
+                _pm = probs.max(dim=1).values.tolist()
+            if _pm:
+                _sm = sorted(_pm); _n = len(_sm)
+                print(f'  [CONFPROBE] step={step} n_tasks={_n} '
+                      f'max={_sm[-1]:.6f} p90={_sm[int(0.9*(_n-1))]:.6f} '
+                      f'median={_sm[_n//2]:.6f} p10={_sm[int(0.1*(_n-1))]:.6f} '
+                      f'min={_sm[0]:.6f} '
+                      f'frac>0.99={sum(v>0.99 for v in _sm)/_n:.3f}', flush=True)
         if _v5_prof:
             _p2['model_fwd'] += time.time() - _t
 
@@ -5059,12 +5117,33 @@ def main():
     # prime is REQUIRED (no default since the 2026-07-15 bug fix): take it from
     # the checkpoint's own training args, falling back to the CLI prime.
     ck = torch.load(args.model, map_location='cpu', weights_only=False)
-    model = IBPActionClassifier(
-        prime=(ck.get('args') or {}).get('prime', args.prime),
+    _cka = ck.get('args') or {}
+    # Build the class the checkpoint was TRAINED with. Defaults to the historical
+    # IBPActionClassifier so existing checkpoints are unaffected; a 'nosubs'
+    # checkpoint has no subs_enc.* keys and fails load_state_dict against the
+    # full class.
+    _variant = _cka.get('model_variant', 'full')
+    # score_activation drives forward()'s SECOND return value, which this beam
+    # consumes as action_prob. 'sigmoid' for bce-trained models -- softmax would
+    # renormalise over the action set and reimpose the action-count dependence
+    # those models are trained without.
+    _act = _cka.get('score_activation', 'softmax')
+    _mkw = dict(
+        prime=_cka.get('prime', args.prime),
         n_indices=topology.n_indices,
         n_denominators=topology.n_denominators,
         n_ibp_ops=topology.n_actions,
     )
+    for _k in ('embed_dim', 'n_heads', 'n_expr_layers', 'n_cross_layers'):
+        if _k in _cka:
+            _mkw[_k] = _cka[_k]
+    if _variant == 'nosubs':
+        from sailir.classifier_nosubs import IBPActionClassifierNoSubs
+        model = IBPActionClassifierNoSubs(score_activation=_act, **_mkw)
+    else:
+        model = IBPActionClassifier(**_mkw)
+    print(f'  model_variant = {_variant}  score_activation = {_act}  '
+          f'prime = {_mkw["prime"]}', flush=True)
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
     if _memprobe_mod is not None:
