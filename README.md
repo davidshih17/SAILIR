@@ -55,6 +55,47 @@ every setting rather than just the setting.**
 | 2. training | [`training/TRAIN_FROM_SCRATCH.md`](training/TRAIN_FROM_SCRATCH.md) | the exact command, what differs from the ftcull recipe and why, epochs, checkpoint selection |
 | 3. the model | [`checkpoints/gravity3L_p101_scratch/README.md`](checkpoints/gravity3L_p101_scratch/README.md) | metrics, how to load (`nosubs` variant), and the `prime=101` warning |
 
+### Why data generation is TWO phases
+
+Training rows are not produced directly from an integral. There are two distinct
+stages, and keeping them separate is what makes the corpus affordable.
+
+**Phase 1 - the closure library.** For a target integral, the truth engine
+solves which IBP identities are needed to reduce it, and emits them as a
+*state-independent SET* of `(op, seed)` rows:
+
+```json
+{"integral": [2,3,3,1,2,1,0,0,0,0,0,0,0,0,0], "sector": 63,
+ "closure": [[op, [seed...]], ...], "pivots": [[...], ...]}
+```
+
+It is a SET, not a path: consuming those rows in ANY order reaches a successful
+reduction. This phase is the expensive one -- 715 CPU-h for 12,584 targets -- so
+it is done in BATCHES, one shared linear system per group of targets in the same
+sector. The first target in a group pays to build the system (median 149 s);
+every later target in that group reads it in 0.1 s. Building per target instead
+costs 6.4x more for identical output.
+
+Closures are also **recorder-independent**: build them once and reuse them for
+every corpus variant. A target with no closure cannot be walked, and belongs in
+the held-out hard set rather than the corpus.
+
+**Phase 2 - the truth walker.** Given a closure, the walker replays the
+reduction one step at a time. At each step it enumerates the candidate actions,
+ranks them, cuts to the top K=1000, keeps only unused closure rows, and writes a
+training row: the state, that culled top-1000 list, and which entry is correct.
+
+The cull is the whole point. `beam_search_v9.py` applies the SAME ranking at
+search time, so the model is fitted on exactly the action space it will later be
+searched in. A corpus recorded over the full enumerated list (up to 34,660
+actions) trains it in a space it never meets at inference.
+
+The walker also **corrupts** 20% of steps by injecting 2-4 random identities,
+knocking the walk off the truth path so the corpus contains recovery states --
+the case a clean recording can never contain. Those scramble rows go into the
+same pool as the truth rows, so nothing downstream can tell a recovery step from
+a truth step.
+
 ### The pipeline in brief
 
 ```bash
