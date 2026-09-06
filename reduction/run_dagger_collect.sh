@@ -22,7 +22,10 @@ INT=$1; OUT=$2; MODE=${3:-errors}
 TAG=$(echo "$INT" | tr ',' '_')          # minus signs PRESERVED (doc §2)
 REGEN=results/truth/closures/regen/out
 MISSING=${SAILIR_DAGGER_MISSING:-results/truth/closures/regen/missing_targets.txt}
-mkdir -p "$(dirname "$MISSING")" logs
+# Per-worker log. Parallel shards MUST NOT share one: beam rows are multi-KB,
+# far over PIPE_BUF, so concurrent appends interleave mid-line.
+LOGF=${SAILIR_DAGGER_LOG:-logs/dagger_collect.log}
+mkdir -p "$(dirname "$MISSING")" "$(dirname "$LOGF")" logs
 
 CL=""
 for D in results/truth/closures/v5_p101_59k/out results/truth/closures/v4_p101_18k/out \
@@ -52,4 +55,4 @@ python -u reduction/beam_search_v9.py \
     --model checkpoints/gravity3L_p101_bce/best_model.pt \
     --integral "$INT" --prime 101 --beam-width 20 --max-steps 40 \
     --max-actions 1000 \
-    --output /tmp/dagger_$TAG.pkl >> logs/dagger_collect.log 2>&1 || true
+    --output /tmp/dagger_$TAG.pkl >> "$LOGF" 2>&1 || true

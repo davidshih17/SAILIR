@@ -49,6 +49,7 @@ DS_USED=${3:-1}
 BUDGET=${4:-500000}
 CAP_MB=${5:-9000}
 WALL_S=${6:-14400}
+JOBS=${SAILIR_REGEN_JOBS:-6}   # groups in parallel; shared box, keep headroom
 DR_NEW=1                 # shipped settings: batch_worker_p101.sh passes neither
 DS_NEW=1
 
@@ -70,7 +71,7 @@ LOG=logs/closure_regen.log
 {
   echo "=== closure regen $(date -Iseconds) ==="
   echo "Command: $0 $*"
-  echo "missing=$MISSING budget=$BUDGET cap=${CAP_MB}MB wall=${WALL_S}s"
+  echo "missing=$MISSING budget=$BUDGET cap=${CAP_MB}MB wall=${WALL_S}s jobs=$JOBS"
   echo "NEW arm dr=$DR_NEW ds=$DS_NEW   USED arm dr=$DR_USED ds=$DS_USED"
   echo "SAILIR_PRIME=$SAILIR_PRIME SAILIR_SECTOR_RANK=$SAILIR_SECTOR_RANK"
 } | tee -a "$LOG"
@@ -108,22 +109,28 @@ run_arm() {                      # $1=todo  $2=dr  $3=ds  $4=label
       --targets "$TODO" --outdir "$GDIR" --budget "$BUDGET" --dr "$DR" --ds "$DS"
   shopt -s nullglob
   local GFILES=("$GDIR"/group_*.json)
-  echo "[$LABEL] groups: ${#GFILES[@]}"
-  local G rc
-  for G in "${GFILES[@]}"; do
-    echo "--- [$LABEL] $G ---"
+  echo "[$LABEL] groups: ${#GFILES[@]}  jobs=$JOBS"
+  [ ${#GFILES[@]} -gt 0 ] || return 0
+  # Groups run JOBS-at-a-time. Serial was the original default for memory
+  # safety, but measured peak is ~1.9 GB per group against 500 GB here, so the
+  # 9 GB cap plus a modest job count is the real guard. Each group still gets
+  # its own timeout and cap, and a failure is logged without killing the rest.
+  printf '%s\n' "${GFILES[@]}" | xargs -P "$JOBS" -I{} bash -c '
+    G="$1"; LABEL="$2"; WALL_S="$3"; DR="$4"; DS="$5"
+    BUDGET="$6"; CAP_MB="$7"; REGEN="$8"
+    echo "--- [$LABEL] $(basename "$G") START ---"
     timeout "$WALL_S" python -u results/truth/closures/batch_closure.py \
         --group "$G" --outdir "$REGEN" \
         --dr "$DR" --ds "$DS" --budget "$BUDGET" --cap-mb "$CAP_MB" \
         --retry-dir "$REGEN/retry"
     rc=$?
     case $rc in
-      0)   ;;
+      0)   echo "[$LABEL] $(basename "$G") OK";;
       42)  echo "[$LABEL] $(basename "$G") exit=42 MEMORY CAP";;
       124) echo "[$LABEL] $(basename "$G") exit=124 WALL-CLOCK TIMEOUT";;
       *)   echo "[$LABEL] $(basename "$G") exit=$rc";;
     esac
-  done
+  ' _ {} "$LABEL" "$WALL_S" "$DR" "$DS" "$BUDGET" "$CAP_MB" "$REGEN"
 }
 
 {

@@ -15,7 +15,8 @@
 set -euo pipefail
 cd /home/shih/work/SAILIR_p101
 TARGETS=$1; OUT=$2; MODE=${3:-errors}
-: > "$OUT"; : > logs/dagger_collect.log
+LOGF=${SAILIR_DAGGER_LOG:-logs/dagger_collect.log}
+: > "$OUT"; : > "$LOGF"
 n=0; skipped=0
 while read -r INT; do
   [ -z "$INT" ] && continue
