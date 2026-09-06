@@ -38,6 +38,81 @@ LI                      Lorentz-invariance identities
 masters                 Kira's master basis
 ```
 
+## gravity3L, p=101, all-indices (this branch)
+
+The `p101-scratch-training` branch carries a complete second pipeline: a 3-loop
+gravity model trained FROM SCRATCH on an all-indices corpus at prime 101. The
+older sections below describe the trianglebox/pentagon-box phase-1 flow and
+still apply to those topologies.
+
+Three documents cover it end to end. **Read them in this order; each is the
+authoritative source for its stage, and each records the measured reason behind
+every setting rather than just the setting.**
+
+| stage | document | what it covers |
+|---|---|---|
+| 1. data | [`results/truth/PRODUCTION_DATA_GENERATION.md`](results/truth/PRODUCTION_DATA_GENERATION.md) | sample targets -> closures -> walks -> shards. Every env var, the K=1000 cull, corruption rates, cluster limits, and **14 pitfalls that each cost real time** |
+| 2. training | [`training/TRAIN_FROM_SCRATCH.md`](training/TRAIN_FROM_SCRATCH.md) | the exact command, what differs from the ftcull recipe and why, epochs, checkpoint selection |
+| 3. the model | [`checkpoints/gravity3L_p101_scratch/README.md`](checkpoints/gravity3L_p101_scratch/README.md) | metrics, how to load (`nosubs` variant), and the `prime=101` warning |
+
+### The pipeline in brief
+
+```bash
+# 1. SAMPLE targets from a real reduction (--exclude is MANDATORY when extending)
+python data-gen/sample_g1023_targets.py --n 59300 --seed <s> \
+  --exclude <existing corpus>.txt --exclude <held-out>.txt \
+  --out targets.txt --verify 200
+
+# 2. GROUP them, then build closures (one Condor job per group).
+#    --no-merge keeps peak RSS ~2.3 GB instead of 12-24 GB.
+python results/truth/closures/make_groups.py \
+  --targets targets.txt --outdir groups/ --budget 500000 --no-merge
+condor_submit <tier-1 .sub>          # see 1.3 for the retry tiers
+
+# 3. WALK each target -> training rows (the K=1000 cull happens here)
+results/truth/p101_cull_corpus/worker.sh <integral>
+#    At scale, drip-feed it -- a 40k-job submission jammed the schedd:
+results/truth/p101_cull_corpus_v2/drip_submit.sh <sub> <targets> 4000 2000 60
+
+# 4. PACK to shards (refuses to run while jobs are still writing)
+results/truth/combine_and_pack.sh
+
+# 5. TRAIN -- see TRAIN_FROM_SCRATCH.md
+```
+
+### Running the trained model on an integral
+
+```bash
+EXPDIR=<dir> results/truth/finetune/p101_beam_worker.sh <tag> prob 40
+```
+
+`<tag>` is the integral with commas as underscores (`1_3_0_1_...`). The worker
+sets the beam configuration that solved the 125-target benchmark
+(`BEAM_SORT=prob`, decay 0.8, NM penalty 0.1, TOP_K 20, `MAX_ACTIONS=1000`
+matching the corpus cull) and calls `reduction/onestep_worker_v9.py`.
+
+**`--prime 101` is not optional for this checkpoint.** Every other model in the
+repo is p=1009; running this one at 1009 produces a wrong coefficient encoding
+SILENTLY -- no error, just wrong numbers. `p101_beam_worker.sh` differs from the
+p=1009 `beamexp_worker.sh` in exactly two places, the checkpoint and the prime.
+
+`EXPDIR` is required and the worker exits 78 without it: it once defaulted, and
+a run's outputs and logs silently landed in different trees for two days.
+
+### Comparing against the baseline
+
+```bash
+python results/truth/finetune/p101_vs_k1000_v2.py
+```
+
+Reports solves and CPU-hours against the K=1000 ftcull model
+([`FULL_125_SOLVERS.md`](results/truth/finetune/FULL_125_SOLVERS.md)), paired
+per target. Count solves ONLY by the `[v7-worker] SUCCESS in` terminal marker --
+`.pkl` counts over-report, and test-set membership comes from the jobs file, not
+from which directory a log sits in.
+
+---
+
 ## Repository layout
 
 ```
