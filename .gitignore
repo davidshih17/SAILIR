@@ -89,3 +89,15 @@ topology_input/*/kira_*/
 
 # DAgger closure regeneration working dirs (rebuildable)
 results/truth/closures/regen/
+
+# SYMMETRY TABLES -- loaded at IMPORT by reduction/topo_config.py, so they must
+# NOT be caught by the blanket *.pkl rule above.
+#
+# NEEDED FOR: beam search and data generation (anything importing topo_config).
+# NOT needed for training -- train_classifier.py and its imports never touch it.
+#
+# 424 KB total. Committing the reduction code WITHOUT them makes a fresh clone
+# fail at import with no obvious cause.
+!results/gravity3L_transforms_v2.pkl
+!results/canonical_sectors_GR_v2.pkl
+!results/sector_canon_maps_GR_engine2.pkl
