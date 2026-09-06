@@ -1606,6 +1606,21 @@ _DAGGER_MODE = os.environ.get('SAILIR_DAGGER_MODE', 'errors')
 _DAGGER_DEADEND = os.environ.get('SAILIR_DAGGER_DEADEND') == '1'
 _DAGGER_FH = None
 _DAGGER_STATS = {'emitted': 0, 'skipped_model_right': 0, 'deadend': 0, 'seen': 0}
+
+# SAILIR_DAGGER_MISSING=<targets.txt> -- record every TARGET whose closure ran
+# out (no unused closure row is legal at a state the model reached). This is
+# the work list for closure REGENERATION.
+#
+# Regeneration is only meaningful at a HIGHER RUNG. truth_engine.worker_replay
+# walks the ladder [(dr,ds), (dr+1,ds), ... ] and BREAKS at the first rung that
+# solves T, so for fixed (dr, ds, SAILIR_SEED_BUDGET) it is deterministic:
+# re-running it reproduces the same closure row for row, and would add nothing.
+# A larger seed box is a strict superset of equations, so escalating dr/ds (and
+# raising the seed budget, which is what makes the deeper rungs reachable at
+# all rather than `continue`-skipped) is what actually produces new rows.
+# reduction/run_closure_regen.sh drives that.
+_DAGGER_MISSING = os.environ.get('SAILIR_DAGGER_MISSING')
+_DAGGER_MISSING_SET = set()
 if _DAGGER_OUT:
     import atexit as _dax
     def _dagger_summary():
@@ -1616,17 +1631,52 @@ if _DAGGER_OUT:
                   f"deadend={st['deadend']} "
                   f"model_error_rate={(st['emitted']+st['deadend'])/st['seen']:.3f}",
                   flush=True)
+        if _DAGGER_MISSING and _DAGGER_MISSING_SET:
+            # append + dedupe on read; several collector runs share one file
+            with open(_DAGGER_MISSING, 'a') as _mf:
+                for _t in sorted(_DAGGER_MISSING_SET):
+                    _mf.write(','.join(str(int(x)) for x in _t) + '\n')
+            print(f"  [DAGGER] {len(_DAGGER_MISSING_SET)} exhausted target(s) "
+                  f"-> {_DAGGER_MISSING}", flush=True)
     _dax.register(_dagger_summary)
 
+# SAILIR_CLOSURE_PROBE accepts a ':'-separated list of closure JSONs and/or
+# DIRECTORIES of them; every entry's rows are UNIONed. A single file path (the
+# original form) still behaves exactly as before.
+#
+# The union matters for regeneration. One closure is the dependency closure of
+# its own target's rule, so the campaign target's closure normally covers the
+# whole reduction. When the model goes off-path it can reach an intermediate
+# target that closure does not span; the fix is a closure built FOR THAT
+# TARGET, which arrives as an extra file. Rows are (op, seed) with seed
+# absolute, so unioning across targets is well defined -- the emitter's
+# membership test is over absolute seeds too.
 _CLOSURE_PROBE = os.environ.get('SAILIR_CLOSURE_PROBE')
 _CLOSURE_PROBE_SET = None
 if _CLOSURE_PROBE:
+    import glob as _clg
     import json as _clj
-    with open(_CLOSURE_PROBE) as _clf:
-        _CLOSURE_PROBE_SET = {(int(_o), tuple(_sd))
-                              for _o, _sd in _clj.load(_clf)['closure']}
+    _cl_files = []
+    for _ent in _CLOSURE_PROBE.split(':'):
+        if not _ent:
+            continue
+        if os.path.isdir(_ent):
+            _cl_files.extend(sorted(_clg.glob(os.path.join(_ent, '*.json'))))
+        else:
+            _cl_files.append(_ent)
+    _CLOSURE_PROBE_SET = set()
+    _cl_ok = 0
+    for _f in _cl_files:
+        try:
+            with open(_f) as _clf:
+                _CLOSURE_PROBE_SET.update((int(_o), tuple(_sd))
+                                          for _o, _sd in _clj.load(_clf)['closure'])
+            _cl_ok += 1
+        except Exception as _e:
+            print(f'  [CLOSUREPROBE] SKIP {_f}: {type(_e).__name__}: {_e}',
+                  flush=True)
     print(f'  [CLOSUREPROBE] loaded {len(_CLOSURE_PROBE_SET)} closure rows '
-          f'from {_CLOSURE_PROBE}', flush=True)
+          f'from {_cl_ok}/{len(_cl_files)} file(s)', flush=True)
 
 
 # Cache keyed on the STORE OBJECT, not the step. _v9_cull runs once per
@@ -2554,6 +2604,8 @@ def _emit_dagger_rows(tasks, beam, probs, target_sector, step):
                 lab.append(_j)
         if not lab:
             _DAGGER_STATS['deadend'] += 1
+            if _DAGGER_MISSING:
+                _DAGGER_MISSING_SET.add(tuple(int(x) for x in _tgt))
             if not _DAGGER_DEADEND:
                 continue
         # model's own pick, to decide whether this state is a mistake

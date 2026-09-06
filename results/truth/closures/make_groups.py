@@ -26,7 +26,16 @@ import sys
 from collections import defaultdict
 from math import comb
 
-B = '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2'
+# Repo root. Was hardcoded to the production cluster path, which made these
+# scripts unrunnable anywhere else (the sys.path inserts below silently pointed
+# at nothing, so `import truth_engine` failed). Same resolution order as
+# reduction/topo_config.py: SAILIR_ROOT > the production path if it exists here
+# > the repo this file lives in.
+_LEGACY_B = '/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2'
+_REPO_B = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       '..', '..', '..'))
+B = os.environ.get('SAILIR_ROOT') or (
+    _LEGACY_B if os.path.isdir(_LEGACY_B) else _REPO_B)
 N_DEN, N_IND = 10, 15
 
 

@@ -17,7 +17,20 @@ Each entry:
 """
 import os
 
-ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
+# ROOT resolution (2026-09-06). The literal below is the canonical checkout on
+# the production cluster and stays the default THERE, so nothing about that
+# machine's behavior changes. It is not a valid path on every box the code now
+# runs on (the p101 training/DAgger host is /home/shih/work/SAILIR_p101), and a
+# stale ROOT is silent: TOPO_DIR/CANON_PKL/STORE_PKL just point at files that do
+# not exist, and the failure surfaces far away as a FileNotFoundError inside
+# canonicalize2's module-level pickle.load.
+#
+# Order: explicit SAILIR_ROOT > the production literal if it exists on this box
+# > the repo this file lives in (<repo>/reduction/topo_config.py -> <repo>).
+_LEGACY_ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.environ.get('SAILIR_ROOT') or (
+    _LEGACY_ROOT if os.path.isdir(_LEGACY_ROOT) else _REPO_ROOT)
 TOPOLOGY = os.environ.get('SAILIR_TOPOLOGY')
 if TOPOLOGY is None:
     # 2026-08-03: the silent pentagonbox default produced wrong-topology

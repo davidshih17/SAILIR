@@ -86,3 +86,6 @@ topology_input/*/kira_*/
 
 # Job marker files
 .done_*
+
+# DAgger closure regeneration working dirs (rebuildable)
+results/truth/closures/regen/
