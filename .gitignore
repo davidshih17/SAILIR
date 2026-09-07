@@ -102,3 +102,5 @@ results/truth/closures/regen/
 !results/canonical_sectors_GR_v2.pkl
 !results/sector_canon_maps_GR_engine2.pkl
 results/dagger/
+data_dagger/
+data_combined/

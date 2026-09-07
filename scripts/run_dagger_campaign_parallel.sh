@@ -32,11 +32,19 @@ echo "Command: $0 $*"
 echo "targets=$N workers=$W mode=$MODE  ->  $RUN"
 echo "cores=$(nproc) load=$(cut -d' ' -f1-3 /proc/loadavg)"
 
-# deterministic sample of targets that HAVE a closure
+# Deterministic sample of targets that HAVE a closure, EXCLUDING any target a
+# previous round already walked. The rollout is deterministic given the model,
+# so re-walking a collected target reproduces its rows exactly -- pure waste.
+# (Once the model is retrained they become worth re-walking; that is a new
+# DAgger iteration, and DONE_LIST should be cleared or pointed elsewhere.)
+DONE=$RUN/.already_done
+cat results/dagger/round_*/targets.txt 2>/dev/null | sort -u > "$DONE" || : > "$DONE"
 ls results/truth/closures/v5_p101_59k/out \
   | sed 's/\.json$//' | tr '_' ',' | sort \
+  | comm -23 - "$DONE" \
   | shuf -n "$N" --random-source=<(yes seed42) > "$RUN/targets.txt"
-echo "sampled $(wc -l < "$RUN/targets.txt") targets"
+echo "sampled $(wc -l < "$RUN/targets.txt") targets "\
+     "(excluded $(wc -l < "$DONE") already walked)"
 
 # split into W shards
 split -n r/"$W" -d --additional-suffix=.txt "$RUN/targets.txt" "$RUN/shard_"
