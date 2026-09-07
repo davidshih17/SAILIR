@@ -1309,9 +1309,19 @@ def main():
         # trained with. Resuming with a DIFFERENT --select_on would compare
         # incomparable numbers and could freeze best_model.pt forever, so reset.
         _ck_sel = (ckpt.get('args') or {}).get('select_on', 'val_loss')
+        _ck_dir = (ckpt.get('args') or {}).get('shards_dir')
         if _ck_sel != args.select_on:
             log(f"  --select_on changed ({_ck_sel} -> {args.select_on}): "
                 f"resetting best score (the stored one is in the old metric's units)")
+            best_val_loss = float('inf')
+        elif _ck_dir and _ck_dir != args.shards_dir:
+            # Same failure, different cause: the score is only comparable
+            # against the val SET it was computed on. DAgger fine-tuning
+            # aggregates harder off-path rows into val, so the inherited best
+            # (measured on the easier base split) can be unbeatable and would
+            # freeze best_model.pt for the whole run.
+            log(f"  --shards_dir changed ({_ck_dir} -> {args.shards_dir}): "
+                f"resetting best score (the stored one is on a different val set)")
             best_val_loss = float('inf')
 
         if args.restart_lr > 0:
