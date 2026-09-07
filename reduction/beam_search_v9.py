@@ -1621,6 +1621,7 @@ _DAGGER_STATS = {'emitted': 0, 'skipped_model_right': 0, 'deadend': 0, 'seen': 0
 # reduction/run_closure_regen.sh drives that.
 _DAGGER_MISSING = os.environ.get('SAILIR_DAGGER_MISSING')
 _DAGGER_MISSING_SET = set()
+_DAGGER_START_INT = None     # the campaign integral T, set in main()
 if _DAGGER_OUT:
     import atexit as _dax
     def _dagger_summary():
@@ -1653,6 +1654,7 @@ if _DAGGER_OUT:
 # membership test is over absolute seeds too.
 _CLOSURE_PROBE = os.environ.get('SAILIR_CLOSURE_PROBE')
 _CLOSURE_PROBE_SET = None
+_CLOSURE_BY_TARGET = {}      # target -> that target's OWN closure rows
 if _CLOSURE_PROBE:
     import glob as _clg
     import json as _clj
@@ -1661,22 +1663,54 @@ if _CLOSURE_PROBE:
         if not _ent:
             continue
         if os.path.isdir(_ent):
-            _cl_files.extend(sorted(_clg.glob(os.path.join(_ent, '*.json'))))
+            _cl_files.extend((_x, True)
+                             for _x in sorted(_clg.glob(os.path.join(_ent, '*.json'))))
         else:
-            _cl_files.append(_ent)
+            _cl_files.append((_ent, False))
+    # SCOPING (2026-09-06). These rows are NOT pooled into one flat set.
+    #
+    # The membership test below is `(op, seed) in <set>` with the seed built
+    # from the STATE'S OWN target, and it was written when that set was ONE
+    # target's closure. Pooling many targets into it silently widens the
+    # oracle: measured, a campaign target's 28-row closure became a 1,013-row
+    # pool once 32 regenerated closures were unioned in -- 97% of the probe set
+    # contributed by unrelated targets, a 36x inflation. That reclassified 178
+    # genuine model errors as "already right" and made the corpus look
+    # mislabelled when the fault was here.
+    #
+    # So: files named EXPLICITLY are the campaign closure (the corpus's own
+    # oracle for this rollout, usually one file), while DIRECTORIES are indexed
+    # per target. A state is then labelled against
+    #     campaign closure  UNION  the closure of that state's own target
+    # which is what "every unused closure row that solves this target" says,
+    # and still lets a regenerated closure label an off-path state without
+    # letting 31 unrelated targets vote.
     _CLOSURE_PROBE_SET = set()
     _cl_ok = 0
-    for _f in _cl_files:
+    for _f, _is_dir in _cl_files:
         try:
             with open(_f) as _clf:
-                _CLOSURE_PROBE_SET.update((int(_o), tuple(_sd))
-                                          for _o, _sd in _clj.load(_clf)['closure'])
+                _cd = _clj.load(_clf)
+            _rows = {(int(_o), tuple(_sd)) for _o, _sd in _cd['closure']}
+            if 'integral' in _cd:
+                _CLOSURE_BY_TARGET.setdefault(
+                    tuple(int(x) for x in _cd['integral']), set()).update(_rows)
+            if not _is_dir:
+                _CLOSURE_PROBE_SET.update(_rows)
             _cl_ok += 1
         except Exception as _e:
             print(f'  [CLOSUREPROBE] SKIP {_f}: {type(_e).__name__}: {_e}',
                   flush=True)
-    print(f'  [CLOSUREPROBE] loaded {len(_CLOSURE_PROBE_SET)} closure rows '
-          f'from {_cl_ok}/{len(_cl_files)} file(s)', flush=True)
+    print(f'  [CLOSUREPROBE] campaign rows={len(_CLOSURE_PROBE_SET)} '
+          f'per-target index={len(_CLOSURE_BY_TARGET)} targets '
+          f'({_cl_ok}/{len(_cl_files)} files)', flush=True)
+
+
+def _in_closure(_o, _seed, _own):
+    """Is this action a closure row for THIS state (campaign or own target)?"""
+    if (_o, _seed) in _CLOSURE_PROBE_SET:
+        return True
+    return _own is not None and (_o, _seed) in _own
 
 
 # Cache keyed on the STORE OBJECT, not the step. _v9_cull runs once per
@@ -2597,10 +2631,11 @@ def _emit_dagger_rows(tasks, beam, probs, target_sector, step):
         st = beam[_pi]
         _DAGGER_STATS['seen'] += 1
         used = {(o, tuple(t[i] + d[i] for i in range(N))) for (t, o, d) in st.path}
+        _own = _CLOSURE_BY_TARGET.get(tuple(int(x) for x in _tgt))
         lab = []
         for _j, (o, d) in enumerate(_valid):
             seed = tuple(_tgt[i] + d[i] for i in range(N))
-            if (o, seed) in _CLOSURE_PROBE_SET and (o, seed) not in used:
+            if _in_closure(o, seed, _own) and (o, seed) not in used:
                 lab.append(_j)
         if not lab:
             _DAGGER_STATS['deadend'] += 1
@@ -2620,7 +2655,8 @@ def _emit_dagger_rows(tasks, beam, probs, target_sector, step):
             'step': step,
             'target': [int(x) for x in _tgt],
             'target_weight': [int(x) for x in ibp_env.weight(_tgt)[:2]],
-            'start_target': [int(x) for x in _tgt],
+            'start_target': (list(_DAGGER_START_INT) if _DAGGER_START_INT
+                             else [int(x) for x in _tgt]),
             'expr': [[[int(x) for x in k], int(v)] for k, v in st.expr.items()],
             'subs': [],
             'valid_actions': [[int(o), [int(x) for x in d]] for (o, d) in _valid],
@@ -4097,10 +4133,11 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 _st = beam[_pi]
                 _used = {(_o, tuple(_t[i] + _d[i] for i in range(_N)))
                          for (_t, _o, _d) in _st.path}
+                _own = _CLOSURE_BY_TARGET.get(tuple(int(x) for x in _tgt))
                 _c = 0
                 for (_o, _d) in _valid:
                     _seed = tuple(_tgt[i] + _d[i] for i in range(_N))
-                    if (_o, _seed) in _CLOSURE_PROBE_SET and (_o, _seed) not in _used:
+                    if _in_closure(_o, _seed, _own) and (_o, _seed) not in _used:
                         _c += 1
                 _avail.append(_c)
             if _DAGGER_OUT is not None:
@@ -5301,8 +5338,14 @@ def main():
     start_int = tuple(int(x) for x in integral_str.split(','))
     start_w = weight(start_int)
     start_w12 = (start_w[0], start_w[1])
-    global _START_TOTAL_KEY
+    global _START_TOTAL_KEY, _DAGGER_START_INT
     _START_TOTAL_KEY = _target_key(start_int)   # for SAILIR_SUCCESS_TOTAL=1
+    # The campaign integral T. preprocess_to_tensors.py reads start_target from
+    # a file's FIRST LINE and applies it to every sample in it, and the field
+    # means "the trajectory's start target": the whole task is defined relative
+    # to T. The emitter previously wrote the per-task target there, which is
+    # right only by accident.
+    _DAGGER_START_INT = list(int(x) for x in start_int)
     print(f'  start integral weight = {start_w}', flush=True)
     print(f'  active threshold      = (w1,w2) >= {start_w12}'
           + (f' AND total-order <= start ({_START_TOTAL_KEY})'
