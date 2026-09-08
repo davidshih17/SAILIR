@@ -25,6 +25,7 @@ import argparse
 import pickle
 import time
 import subprocess
+import json
 import os
 import resource
 from pathlib import Path
@@ -34,6 +35,11 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))   # repo root (SAILIR_phase2) for `sailir`
 sys.path.insert(0, str(_HERE.parent))          # this dir (reduction/) for siblings
 
+import re as _re
+# Worker step line: pull max weight, non-master count, store size, time.
+_DIVERGE_LINE = _re.compile(
+    r'\[v6 step +(\d+)\].*?best mw=\((\d+), (\d+),.*?'
+    r'nm=(\d+).*?rs_vsz=(\d+).*?t_total=([0-9.]+)')
 from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
 
@@ -193,13 +199,24 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
         # (SUCCESS_TOTAL=1 total-weight single-step success, (r,s) maxweight
         # action-cap, GNU MKL layer + affinity pin so the worker stays <= request
         # on Condor). v7_cpus==1 => serial, no fork pool. Same CLI as v6.
-        worker_script = 'onestep_worker_v7.py'
+        # SAILIR_WORKER_V9=1 swaps in onestep_worker_v9.py. Its CLI is
+        # IDENTICAL to v7's (verified: 22 shared flags, zero differences) and it
+        # writes the same orchestrator-format result.pkl, so reaping is
+        # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
+        # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
+        # configuration validated at 125/125 and 300/300.
+        worker_script = ('onestep_worker_v9.py'
+                         if os.environ.get('SAILIR_WORKER_V9') == '1'
+                         else 'onestep_worker_v7.py')
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
                        f' --output {output_file}'
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}')
+                       f'{paper_masters_flag}{resume_flag}'
+                       # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
+                       # with no env equivalent, notably --no-tabu.
+                       f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
@@ -246,6 +263,20 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     if os.environ.get('SAILIR_TOPOLOGY'):
         _envs = (_envs + " " if _envs else "") + \
             f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
+    # GREEDY knobs, forwarded ONLY when explicitly set, so default runs stay
+    # byte-identical. Condor does not inherit our env and beam_search_v9 reads
+    # these AT IMPORT, so omitting one silently yields a different search:
+    # NM_PENALTY != 0 perturbs the argmax, i.e. width 1 stops being greedy.
+    # SAILIR_BEAM_SORT is LOAD-BEARING and easy to miss: the v7/v9 arg builder
+    # does NOT pass --beam-sort, and onestep_worker_v9.py defaults it to
+    # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
+    # measured, that variant logs p_top=0.0 at states where the model is at
+    # 0.9999 and drives nm to 15. It must be forwarded explicitly.
+    for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
+               'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
+        if os.environ.get(_v) is not None:
+            _envs = (_envs + " " if _envs else "") + \
+                f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -313,13 +344,24 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
         else:
             memory = memory_gb if memory_gb else 4
     if use_v7_worker:
-        worker_script = 'onestep_worker_v7.py'
+        # SAILIR_WORKER_V9=1 swaps in onestep_worker_v9.py. Its CLI is
+        # IDENTICAL to v7's (verified: 22 shared flags, zero differences) and it
+        # writes the same orchestrator-format result.pkl, so reaping is
+        # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
+        # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
+        # configuration validated at 125/125 and 300/300.
+        worker_script = ('onestep_worker_v9.py'
+                         if os.environ.get('SAILIR_WORKER_V9') == '1'
+                         else 'onestep_worker_v7.py')
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
                        f' --output {output_file}'
                        f' --model-checkpoint {model_checkpoint}'
                        f' --beam_width {beam_width} --max_steps {max_steps}'
                        f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}')
+                       f'{paper_masters_flag}{resume_flag}'
+                       # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
+                       # with no env equivalent, notably --no-tabu.
+                       f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
     elif use_v6_worker:
         worker_script = 'onestep_worker_v6.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
@@ -369,6 +411,20 @@ def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps
     if os.environ.get('SAILIR_TOPOLOGY'):
         _envs = (_envs + " " if _envs else "") + \
             f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
+    # GREEDY knobs, forwarded ONLY when explicitly set, so default runs stay
+    # byte-identical. Condor does not inherit our env and beam_search_v9 reads
+    # these AT IMPORT, so omitting one silently yields a different search:
+    # NM_PENALTY != 0 perturbs the argmax, i.e. width 1 stops being greedy.
+    # SAILIR_BEAM_SORT is LOAD-BEARING and easy to miss: the v7/v9 arg builder
+    # does NOT pass --beam-sort, and onestep_worker_v9.py defaults it to
+    # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
+    # measured, that variant logs p_top=0.0 at states where the model is at
+    # 0.9999 and drives nm to 15. It must be forwarded explicitly.
+    for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
+               'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
+        if os.environ.get(_v) is not None:
+            _envs = (_envs + " " if _envs else "") + \
+                f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     parts = [f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -521,6 +577,28 @@ def main():
                         default=True,
                         help='Reduce to paper masters only (no corner integrals). '
                              'Default: ON (trianglebox paper recipe).')
+    parser.add_argument('--diverge-nm', type=int, default=0,
+                        help='Kill a worker whose non-master count reaches N '
+                             'and RETURN ITS SLOT (0 = off). A diverging worker '
+                             'never finishes and has no wall cap. The integral '
+                             'is recorded to work_dir/diverged_killed.jsonl and '
+                             'never resubmitted (otherwise the freed slot is '
+                             'immediately refilled by the same divergence).')
+    parser.add_argument('--diverged-from', type=str, action='append',
+                        default=None,
+                        help='Path to a PRIOR run\'s diverged/killed jsonl '
+                             '(diverged_killed.jsonl, or the external '
+                             'watchdog\'s killed_diverging.jsonl). Those '
+                             'integrals are seeded into the diverged set and '
+                             'NEVER dispatched. Repeatable. Without this a '
+                             'resumed run re-runs every known-divergent '
+                             'integral: they produced no result, so they are '
+                             'not in the cache -- measured 254 of 454 workers '
+                             '(56%%) on the g1023 round-2 resume.')
+    parser.add_argument('--diverge-mem-mb', type=int, default=0,
+                        help='Also kill on MemoryUsage >= this many MB '
+                             '(0 = off). One condor_q per iteration, not one '
+                             'per worker.')
     parser.add_argument('--straggler-timeout', type=int, default=3600,
                         help='Seconds of actual Condor RUN time (excluding queue wait) before a '
                              'job is considered a straggler (default 60 min)')
@@ -548,7 +626,12 @@ def main():
     # PAPER DEFAULT: mixed (trianglebox-paper recipe — two parallel sub-beams,
     # one sorted by max-weight, one by total sum of weights).
     parser.add_argument('--beam-sort', type=str, default='mixed',
-                        choices=['weight', 'nterms', 'score', 'totalweight', 'mixed'],
+                        # 'prob' added 2026-09-07 for the GREEDY worker: at
+                        # --beam_width 1 with SAILIR_NM_PENALTY=0 the single
+                        # survivor is the model's plain argmax. It was absent
+                        # here, so `--beam-sort prob` used to die in argparse.
+                        choices=['weight', 'nterms', 'score', 'totalweight',
+                                 'mixed', 'prob'],
                         help='Beam sort key for worker jobs. Default: mixed '
                              '(trianglebox paper recipe).')
     # PAPER DEFAULT: dedup OFF (trianglebox-paper recipe).
@@ -729,6 +812,42 @@ def main():
     # Pending is dropped (any in-flight workers should be condor_rm'd before
     # restarting the orchestrator). This is the orchestrator-level resume; the
     # worker-level resume (per-integral) is independent.
+    # Integrals abandoned as divergent: killed, slot returned, NEVER resubmitted.
+    diverged = set()
+    if args.diverged_from:
+        import re as _re2
+        _tagpat = _re2.compile(r'async_\d+_(.+)$')
+        for _p in args.diverged_from:
+            _n = 0
+            try:
+                for _l in open(_p, errors='ignore'):
+                    _l = _l.strip()
+                    if not _l:
+                        continue
+                    try:
+                        _d = json.loads(_l)
+                    except Exception:
+                        continue
+                    # integrated format records 'integral'; the external
+                    # watchdog recorded only the log basename async_<id>_<tag>
+                    _t = _d.get('integral')
+                    if not _t:
+                        _m = _tagpat.match(_d.get('log', ''))
+                        _t = _m.group(1) if _m else None
+                    if not _t:
+                        continue
+                    try:
+                        diverged.add(tuple(int(x) for x in
+                                           _t.replace(',', '_').split('_')))
+                        _n += 1
+                    except ValueError:
+                        pass
+            except OSError as _e:
+                print(f'  WARNING: --diverged-from {_p}: {_e}', flush=True)
+            print(f'[DIVERGED-FROM] {_n} integrals from {_p}', flush=True)
+        print(f'[DIVERGED-FROM] {len(diverged)} distinct integrals will never '
+              f'be dispatched', flush=True)
+
     if args.resume:
         import glob
         t_resume = time.time()
@@ -946,6 +1065,12 @@ def main():
 
         # Integrals to submit: non-masters not in cache and not pending
         to_submit = non_masters - set(cache.keys()) - set(pending.keys())
+        # Integrals abandoned as DIVERGENT are never resubmitted. Without this
+        # the kill would free the slot and the very next iteration would
+        # resubmit the same integral, which would diverge again -- an infinite
+        # kill/resubmit loop.
+        if diverged:
+            to_submit = to_submit - diverged
 
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
@@ -1035,6 +1160,83 @@ def main():
 
         # Wait a bit
         time.sleep(args.check_interval)
+
+        # ── DIVERGENCE SWEEP ────────────────────────────────────────────
+        # A diverging worker never finishes: non-masters and the substitution
+        # store grow without bound (measured on g1023: nm 2261 from a start of
+        # 3, weight r=215 from 11, store 592k). Workers have NO wall cap, so
+        # each one holds a CPU forever.
+        #
+        # CRITICAL DIFFERENCE from the external watchdog this replaces: the
+        # entry is DELETED FROM `pending`, so the slot is returned. The
+        # external version could only condor_rm, leaving the entry forever --
+        # `available_slots = max_concurrent - len(pending)` then decays to zero
+        # and the orchestrator stops submitting. Measured: 625 of 1000 slots
+        # dead after 7 h, only 210 real jobs on the cluster.
+        if args.diverge_nm > 0 and pending:
+            mem = {}
+            if args.diverge_mem_mb > 0:
+                try:
+                    _r = subprocess.run(
+                        ['condor_q', '-af:,', 'ClusterId', 'ProcId',
+                         'MemoryUsage'], capture_output=True, text=True,
+                        timeout=60)
+                    for _l in _r.stdout.splitlines():
+                        _f = [x.strip() for x in _l.split(',')]
+                        if len(_f) >= 3:
+                            try:
+                                mem[f'{_f[0]}.{_f[1]}'] = int(float(_f[2]))
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
+            _rm, _rec = [], []
+            for integral, (cluster_id, output_file, _st, _cp) in list(pending.items()):
+                if not cluster_id or output_file.exists():
+                    continue
+                wlog = work_dir / 'logs' / (Path(output_file).stem + '.out')
+                if not wlog.exists():
+                    continue
+                try:
+                    txt = wlog.read_text(errors='ignore')
+                except Exception:
+                    continue
+                if 'SUCCESS in' in txt or 'INCOMPLETE in' in txt:
+                    continue
+                hits = _DIVERGE_LINE.findall(txt)
+                if not hits:
+                    continue
+                step, wr, ws, nm, rsv, tt = hits[-1]
+                why = []
+                if int(nm) >= args.diverge_nm:
+                    why.append(f'nm>={args.diverge_nm}')
+                mb = mem.get(str(cluster_id), 0)
+                if args.diverge_mem_mb > 0 and mb >= args.diverge_mem_mb:
+                    why.append(f'mem>={args.diverge_mem_mb}MB')
+                if not why:
+                    continue
+                _rm.append(str(cluster_id))
+                _rec.append(dict(integral=integral_to_str(integral),
+                                 cluster=str(cluster_id), reason='+'.join(why),
+                                 nm=int(nm), nm_start=int(hits[0][3]),
+                                 max_w_r=int(wr), max_w_r_start=int(hits[0][1]),
+                                 step=int(step), rs_vsz=int(rsv), mem_mb=mb,
+                                 t_total=float(tt), iteration=iteration,
+                                 killed_at=time.strftime('%F %T')))
+                diverged.add(integral)
+                del pending[integral]          # <-- returns the slot
+            if _rm:
+                try:
+                    subprocess.run(['condor_rm'] + _rm, capture_output=True,
+                                   text=True, timeout=180)
+                except Exception:
+                    pass
+                with open(work_dir / 'diverged_killed.jsonl', 'a') as _fh:
+                    for _d in _rec:
+                        _fh.write(json.dumps(_d) + chr(10))
+                print(f"[Iter {iteration}] DIVERGENCE: killed {len(_rm)} "
+                      f"(total {len(diverged)}); slots returned to the pool",
+                      flush=True)
 
         # Check for stragglers (jobs that have been RUNNING on Condor too long
         # — queue/idle wait time is excluded). Resubmit them with more CPUs.

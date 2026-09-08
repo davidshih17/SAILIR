@@ -30,7 +30,7 @@ v6 changes:
 What we keep from v5:
   - strip-passenger semantics (apply_substitution_v5, add_sub_to_resolved_v5)
   - aux_flat / LAZY_RS / iraws-keep-first / tabu
-  - --beam-sort {weight,mixed}
+  - --beam-sort {weight,mixed,prob,dual,toptotal}
   - any() termination on first state with nm=0
 """
 import argparse
@@ -797,6 +797,54 @@ def _truth_trace_step(step, parents, candidates, beam, sort_w, sort_p,
         del _ALL_PARENT[:]
         _trace_fh.write(_json.dumps(_rec2) + chr(10))
         _trace_fh.flush()
+    # TRUTH CANDIDATE vs THE BEAM THAT DISPLACED IT.
+    # Fires whenever the truth child exists as a CANDIDATE but is not in the
+    # post-selection beam -- the case `cmp` was meant for but misses, because
+    # its trigger (cand_best > best) is false when the beam still holds a
+    # SHALLOWER truth state. Records the actual sort keys on both sides so the
+    # question "did it lose on weight or on probability" is answered with
+    # numbers instead of inference.
+    if _trace_fh is not None and cand_alive:
+        _tcand = next((c for c in candidates if _depth(c) == cand_best), None)
+        _in_beam = any(_depth(b) == cand_best for b in beam)
+        if _tcand is not None and not _in_beam and beam:
+            import json as _j3
+            # FULL keys, never truncated. These fields used to log
+            # max_w12[:2] / total_w12[:2], written when those really were
+            # 2-tuples. Under SAILIR_BEAM_TOTAL=1 they are the full ordering
+            # tuple (r, s, |a|), and slicing dropped the |a| component from BOTH
+            # the printout AND the comparisons -- which made the key look
+            # degenerate ("every beam state tied") when it was only the readout
+            # that was blind. The sort was always using the full key.
+            _mw = lambda b: tuple(b.max_w12)
+            _tw = lambda b: tuple(b.total_w12)
+            _bw = sorted(beam, key=_mw)
+            _bt = sorted(beam, key=_tw)
+            _trace_fh.write(_j3.dumps(dict(
+                event='TRUTH_CAND_DISPLACED', step=step, depth=cand_best,
+                beam_total_on=bool(_BEAM_TOTAL),
+                truth_max_w12=_mw(_tcand),
+                truth_total_w12=_tw(_tcand),
+                truth_nm=int(_tcand.n_non_masters),
+                truth_score=float(_tcand.score),
+                beam_max_w12_best=_mw(_bw[0]),
+                beam_max_w12_worst=_mw(_bw[-1]),
+                beam_total_w12_best=_tw(_bt[0]),
+                beam_total_w12_worst=_tw(_bt[-1]),
+                n_distinct_maxw=len({_mw(b) for b in beam}),
+                truth_maxw_rank=int(sum(1 for b in beam
+                                        if _mw(b) < _mw(_tcand))) + 1,
+                beam_score_best=float(max(b.score for b in beam)),
+                beam_score_worst=float(min(b.score for b in beam)),
+                n_beam_better_maxw=int(sum(
+                    1 for b in beam if _mw(b) < _mw(_tcand))),
+                n_beam_better_totalw=int(sum(
+                    1 for b in beam if _tw(b) < _tw(_tcand))),
+                n_beam_better_score=int(sum(
+                    1 for b in beam if b.score > _tcand.score)),
+                n_beam=len(beam))) + chr(10))
+            _trace_fh.flush()
+
     rec = dict(step=step, truth_depth=best, n_on_truth=len(alive),
                cand_depth=cand_best, n_cand_on_truth=len(cand_alive),
                culled=bool(cand_best > best), cmp=_cmp,
@@ -3396,6 +3444,29 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             _bs = frozenset(frozenset(s.expr.items()) for s in beam)
             _beam_set_history.append((step, len(_bs), hash(_bs)))
 
+        # TRUTH-PATH BEAM CENSUS (SAILIR_TRUTH_CENSUS=1). Written BEFORE the
+        # macro dedup and before enumeration, so a truth state that is in the
+        # beam but never reaches the enumerator is visible. Without this, the
+        # trace jumps from "on the truth path" to "child never generated" with
+        # nothing in between -- which is exactly where a depth-4 loss hid.
+        if (_trace_fh is not None and _truth_actions
+                and os.environ.get('SAILIR_TRUTH_CENSUS') == '1'):
+            import json as _jc
+
+            def _dc(st):
+                n = len(st.path)
+                return n if (n <= len(_truth_actions) and
+                             all(st.path[i] == _truth_actions[i]
+                                 for i in range(n))) else -1
+            _dd = [_dc(x) for x in beam]
+            _on = [i for i, d in enumerate(_dd) if d >= 0]
+            _trace_fh.write(_jc.dumps(dict(
+                event='BEAM_CENSUS', step=step, n_beam=len(beam),
+                depths_on_truth=[_dd[i] for i in _on],
+                beam_idx_on_truth=_on,
+                max_depth=max(_dd) if _dd else -1)) + chr(10))
+            _trace_fh.flush()
+
         # ── v6: macro-beam dedup ──────────────────────────────────────────
         # Collapse beam slots that share the same expr_fp. The model only
         # sees expr + RS_KEYS (not values; see prepare_batched_input_v5_dummy)
@@ -3408,9 +3479,17 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # representative, expand only that lane, and the other lane -- whose
         # children inherit the parent's lane -- would receive no candidates at
         # all and vanish on the first step.
-        macro_groups = {}  # expr_fp (or (expr_fp, lane)) → best State
+        # Same key as the early dedup (SAILIR_DEDUP_KEY, default 'exprpath'):
+        # a state is (expr, subs), and the path distinguishes stores without
+        # materialising them. Fixing only the early copy moved the kill here --
+        # measured on 1,0,1,0,0,0,5,1,1,1, where the truth state survived to
+        # depth 4 and was then deleted by THIS dedup at the next step.
+        _dedup_key_top = os.environ.get('SAILIR_DEDUP_KEY', 'exprpath')
+        macro_groups = {}  # key → best State
         for s in beam:
             efp = frozenset(s.expr.items())
+            if _dedup_key_top == 'exprpath':
+                efp = (efp, frozenset(s.path))
             if beam_sort == 'dual':
                 efp = (efp, s.lane)
             cur = macro_groups.get(efp)
@@ -4287,9 +4366,50 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         except ValueError:
                             _vi = -1
                         import json as _j
+                        if _vi < 0:
+                            # SILENT BEFORE: the one case that matters most --
+                            # the truth action is not even in the enumerated
+                            # set, so it can never be ranked, expanded or
+                            # selected. Writing nothing here made a depth-4
+                            # enumeration failure indistinguishable from the
+                            # scorer never running.
+                            _trace_fh.write(_j.dumps(dict(
+                                event='TRUTH_NOT_ENUMERATED', depth=_n,
+                                target=list(target),
+                                truth_op=int(_ta[1]),
+                                truth_delta=list(_ta[2]),
+                                n_valid=len(valid))) + chr(10))
+                            _trace_fh.flush()
                         if _vi >= 0:
                             _ordr = np.argsort(-row)
                             _rank = int(np.where(_ordr == _vi)[0][0])
+                            # WHAT BEAT IT. When the truth action is demoted,
+                            # the useful question is whether the model chose
+                            # another action that is ALSO on the truth walk --
+                            # i.e. a legitimate alternative rather than a
+                            # mistake. Records the top-1 action and whether that
+                            # (op, delta) appears anywhere in the truth action
+                            # sequence, and if so at what depth.
+                            _top_i = int(_ordr[0])
+                            _top_act = (list(valid)[_top_i]
+                                        if _top_i < len(valid) else None)
+                            _top_in_truth = -1
+                            if _top_act is not None:
+                                for _k, _tk in enumerate(_truth_actions):
+                                    if (_tk[1], _tk[2]) == (_top_act[0],
+                                                            _top_act[1]):
+                                        _top_in_truth = _k
+                                        break
+                            _trace_fh.write(_j.dumps(dict(
+                                event='TRUTH_TOP1', depth=_n,
+                                truth_rank=_rank,
+                                top_op=(int(_top_act[0])
+                                        if _top_act else None),
+                                top_delta=(list(_top_act[1])
+                                           if _top_act else None),
+                                top_action_is_truth_action_at_depth=_top_in_truth,
+                                n_valid=len(valid))) + chr(10))
+                            _trace_fh.flush()
                             _trace_fh.write(_j.dumps(dict(
                                 event='TRUTH_SCORE', depth=_n,
                                 model_rank=_rank, K=int(K), n_valid=int(n_v),
@@ -4535,6 +4655,56 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 beam = (_res + _rest)[:beam_width]
             else:
                 beam = candidates[:beam_width]
+        elif beam_sort == 'toptotal':
+            # PER-PARENT POOL + MAX-LEX-WEIGHT RANKING.
+            #
+            #   1. from each beam state take only its top-N actions by model
+            #      score (SAILIR_TOPN_PER_PARENT, default 3), so no single
+            #      confident parent can flood the candidate pool;
+            #   2. rank the pooled survivors by the MAX lex weight over the
+            #      non-masters -- s.max_w12, the largest single remaining
+            #      integral -- with the model score breaking ties.
+            #
+            # NOT total_w12. total_w12 is the SUM of the non-master weights,
+            # which punishes the temporary EXPANSION that a correct reduction
+            # has to pass through. Measured on 1,0,1,0,0,0,5,1,1,1 at depth 4:
+            # the true child is TIED BEST on max weight ([10,1], 0 of 40 beam
+            # states better) but WORST of all 40 on total weight ([50,5] vs a
+            # beam spanning [20,2]..[40,4]) -- evicted one step after the model
+            # ranked it #1 at p=0.848.
+            #
+            # NO n_non_masters term either: the tiebreak is the model score, as
+            # specified. sort_weight carries (max_w12, n_non_masters, -score),
+            # and that middle term is the same expansion penalty in another
+            # form -- the true child above holds 5 non-masters against the
+            # beam's 2-4, so an nm tiebreak demotes it for the very property
+            # that makes it correct.
+            _npp = int(os.environ.get('SAILIR_TOPN_PER_PARENT', '3') or 3)
+            _by_parent = {}
+            for _c in candidates:
+                _mi = meta_by_id.get(id(_c))
+                _par = cand_metadata[_mi][0] if _mi is not None else None
+                _by_parent.setdefault(id(_par), []).append(_c)
+            _kept = []
+            for _grp in _by_parent.values():
+                _grp.sort(key=lambda s: -s.score)     # model's own ranking
+                _kept.extend(_grp[:_npp])
+            # ascending max_w12: smaller weight is better, the codebase-wide
+            # convention (same direction as sort_weight).
+            # PRIMARY AND ONLY KEY: the MAX TOTAL LEX WEIGHT over the
+            # non-masters. With SAILIR_BEAM_TOTAL=1 s.max_w12 is the FULL
+            # ordering tuple (r, s, |a|) from _mw_tw_from_nm -- the single
+            # source of truth -- not the truncated (r,s). Dropping |a| is
+            # what made the key degenerate: measured, every one of the 40
+            # beam states tied at [10,1], so the tiebreak became the whole
+            # sort.
+            #
+            # NO model-probability tiebreak. A prob tiebreak fails exactly
+            # where the model is unreliable, which is the case it exists to
+            # handle. Python's sort is stable, so genuine ties keep pool
+            # order (parent-grouped, model-ranked within a parent).
+            _kept.sort(key=lambda s: s.max_w12)
+            beam = _kept[:beam_width]
         elif beam_sort == 'mixed':
             half = beam_width // 2
             by_w = sorted(candidates, key=sort_weight)
@@ -4653,10 +4823,30 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # only on expr / max_w12 / n_non_masters / score — all of which
         # are unchanged by materialization) and saves the wasted work.
         # The next-step dedup becomes a no-op.
+        # KEY: expression AND the action SET (SAILIR_DEDUP_KEY).
+        #   expr      legacy -- keys on the expression alone. UNSOUND: a state
+        #             is (expr, subs), and two states with the same expression
+        #             but different substitution stores have DIFFERENT available
+        #             actions. Measured on 1,0,1,0,0,0,5,1,1,1: at step 3 this
+        #             deleted the state on the winning path because a same-expr
+        #             sibling scored 0.47 nats better (-2.4653 vs -2.9381) on
+        #             the -score tiebreak; identical max_w12 and nm. The correct
+        #             action was then unavailable at step 4 and the run drifted
+        #             for 2,950 steps.
+        #   exprpath  DEFAULT. Adds frozenset(path). resolved_subs is a
+        #             deterministic function of the path, so the path
+        #             distinguishes stores WITHOUT materialising them -- lazy
+        #             states carry resolved_subs=None, so any key over the store
+        #             itself would force the materialisation this early dedup
+        #             exists to avoid. frozenset (not tuple) so two states that
+        #             took the same actions in a different order still merge.
+        _dedup_key = os.environ.get('SAILIR_DEDUP_KEY', 'exprpath')
         if len(beam) > 1:
             early_groups = {}
             for s in beam:
                 efp = frozenset(s.expr.items())
+                if _dedup_key == 'exprpath':
+                    efp = (efp, frozenset(s.path))
                 if beam_sort == 'dual':
                     efp = (efp, s.lane)   # keep the lanes separate (see above)
                 cur = early_groups.get(efp)
@@ -4668,7 +4858,54 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     print(f'[v6 step {step}] early-dedup: {len(beam)} → '
                           f'{len(early_groups)} distinct expr (pre-materialize)',
                           flush=True)
-                beam = list(early_groups.values())
+                # EARLY-DEDUP TRUTH CHECK. The dedup at the TOP of the next step
+                # carries a DEDUP_KILLED_TRUTH instrument, but this one runs
+                # first and makes that one a no-op -- so a truth state killed
+                # here was invisible. Records the survivor that displaced it and
+                # both sort keys, because the key is (max_w12, nm, -score) on
+                # states that share an EXPRESSION but not a substitution store.
+                _newb = list(early_groups.values())
+                if _trace_fh is not None and _truth_actions:
+                    import json as _j4
+
+                    def _de(st):
+                        n = len(st.path)
+                        return n if (n <= len(_truth_actions) and
+                                     all(st.path[i] == _truth_actions[i]
+                                         for i in range(n))) else -1
+                    _pre_d = max((_de(x) for x in beam), default=-1)
+                    _post_d = max((_de(x) for x in _newb), default=-1)
+                    if _pre_d >= 0 and _post_d < _pre_d:
+                        _victim = next(x for x in beam if _de(x) == _pre_d)
+                        _efp = frozenset(_victim.expr.items())
+                        if beam_sort == 'dual':
+                            _efp = (_efp, _victim.lane)
+                        _surv = early_groups.get(_efp)
+                        _trace_fh.write(_j4.dumps(dict(
+                            event='EARLY_DEDUP_KILLED_TRUTH', step=step,
+                            depth=_pre_d, depth_after=_post_d,
+                            n_before=len(beam), n_after=len(_newb),
+                            victim_max_w12=list(_victim.max_w12[:2]),
+                            victim_nm=int(_victim.n_non_masters),
+                            victim_score=float(_victim.score),
+                            # resolved_subs is None under LAZY_RS until
+                            # materialisation -- report -1 rather than crash.
+                            victim_n_subs=(len(_victim.resolved_subs)
+                                           if _victim.resolved_subs is not None
+                                           else -1),
+                            surv_max_w12=(list(_surv.max_w12[:2])
+                                          if _surv is not None else None),
+                            surv_nm=(int(_surv.n_non_masters)
+                                     if _surv is not None else None),
+                            surv_score=(float(_surv.score)
+                                        if _surv is not None else None),
+                            surv_n_subs=(len(_surv.resolved_subs)
+                                         if (_surv is not None
+                                             and _surv.resolved_subs is not None)
+                                         else -1),
+                            same_expr=bool(_surv is not None))) + chr(10))
+                        _trace_fh.flush()
+                beam = _newb
 
         # Tabu: now that beam survivors are finalised, record (target, op,
         # delta) of EACH survivor's last action under its parent's expr_fp.
@@ -4839,7 +5076,15 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             rs_vsz = sum(len(v) for v in best_in_beam.resolved_subs.values())
             # v6: count distinct exprs in beam to measure diversity gain.
             n_uniq_expr = len({frozenset(s.expr.items()) for s in beam})
+            # p_top = the model's probability on the action that produced the
+            # best state. Under SAILIR_SCORE=local, state.score IS the log-prob
+            # of that single action, so exp() recovers it exactly. Under decay
+            # it is a decayed sum and NOT a probability -- so only print it when
+            # local, rather than emit a number that invites misreading.
+            _ptop = (f'p_top={math.exp(max(best_in_beam.score, -60)):.4f} '
+                     if _SCORE_MODE not in ('cumulative', 'decay') else '')
             print(f'[v6 step {step+1:>3}] beam={len(beam)} '
+                  f'{_ptop}'
                   f'uniq_expr={n_uniq_expr} '
                   f'best mw={mw_best} nm={nm_best} '
                   f'rs={sz_rs} rs_vsz={rs_vsz} '

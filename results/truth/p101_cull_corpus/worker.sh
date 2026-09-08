@@ -103,8 +103,12 @@ echo "[worker] target=$1 tag=$TAG closure=$(basename $SAILIR_TRUTH_CLOSURE)"
 # A capped target is exit 124 and belongs in the HARD-TARGET set (README 1.3c),
 # and its PARTIAL train file must be deleted: a truncated walk is not the same
 # as the contract-violation failures the reference corpus keeps.
+# NOTE the order: `timeout CMD` execs CMD directly, so an inline VAR=VAL
+# assignment in front of the interpreter is treated as the command name and
+# fails with "No such file or directory". The export must come BEFORE timeout.
+export PYTHONUNBUFFERED=1
 timeout "${SAILIR_WALK_WALL:-18000}" \
-PYTHONUNBUFFERED=1 /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python -u \
+/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python -u \
   $B/reduction/onestep_worker_truthcull.py \
   --topology $B/topology_input/gravity3L \
   --integral="$1" \

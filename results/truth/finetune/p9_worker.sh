@@ -19,7 +19,7 @@
 #   $1 = target tag   $2 = beam_sort mode   $3 = beam width
 set -u
 B=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
-export SAILIR_BEAM_SORT=$2
+# SAILIR_BEAM_SORT removed: no beam_sort parameter remains
 # Overridable. Default 'decay' keeps every existing .sub byte-identical.
 # SAILIR_SCORE=local scores a state by the log-probability of the LAST
 # action only. MEASURED reason to want it: with tabu off, at depth 9 the
@@ -27,16 +27,14 @@ export SAILIR_BEAM_SORT=$2
 # and the truth path loses on a decayed debt from its depth-2 step
 # (p=0.0025, ~6 nats, still ~1.3 after decay) despite its CURRENT move
 # being rank 2 at p=0.113. Local scoring drops the debt.
-export SAILIR_SCORE=${SAILIR_SCORE:-decay}
-export SAILIR_SCORE_DECAY=0.8
+# SAILIR_SCORE removed: score mode folded to local
 # Overridable. Default 0.1 keeps every existing .sub byte-identical.
 # THIS LINE WAS UNCONDITIONAL until 2026-09-07 and silently overrode
 # SAILIR_NM_PENALTY set in the submit file -- so the 125/125 and 300/300
 # greedy runs, which I described as 'plain argmax', actually selected on
 # (action log-prob - 0.1 * n_non_masters). Their banners say NM_PEN=0.1.
 export SAILIR_NM_PENALTY=${SAILIR_NM_PENALTY:-0.1}
-export SAILIR_TOP_K=20
-export SAILIR_MAX_ACTIONS=1000          # matches the corpus's K=1000 cull
+# SAILIR_TOP_K removed: top_k=20 is now a real parameter default
 export SAILIR_V9_CULL=1
 export SAILIR_V9_UPENUM=1
 export SAILIR_RAW_EQ_CACHE_CAP=1000000000
@@ -59,7 +57,7 @@ mkdir -p $D/out $D/ckpt/$1 $D/logs
 #   SAILIR_BEAM_WALL  wall clock, default 1800s. The known solve took 10.6s.
 #   SAILIR_MAX_STEPS  step cap, default 50000 (= the previous hardcoded value,
 #                     so existing .sub files are unchanged).
-# Memory has NO in-process cap in onestep_worker_v9.py (unlike the walk
+# Memory has NO in-process cap in onestep_worker_p9.py (unlike the walk
 # worker), so it is bounded by the Condor reservation + periodic_hold instead.
 #
 # `timeout` execs its command directly, so an inline VAR=VAL in front of the
@@ -68,12 +66,11 @@ mkdir -p $D/out $D/ckpt/$1 $D/logs
 export PYTHONUNBUFFERED=1
 exec timeout "${SAILIR_BEAM_WALL:-1800}" \
   /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python -u \
-  $B/reduction/onestep_worker_v9.py \
+  $B/reduction/onestep_worker_p9.py \
   --topology $B/topology_input/gravity3L \
   --integral="$(echo "$1" | tr '_' ',')" \
   --output $D/out/$1.pkl \
   --model-checkpoint $B/checkpoints/gravity3L_p101_scratch/best_model.pt \
-  --iraws-keep-first 1000000 \
   --checkpoint-path $D/ckpt/$1/ckpt.pkl \
   --checkpoint-interval 100 \
   --beam_width $3 --max_steps ${SAILIR_MAX_STEPS:-50000} --prime 101 --v7-cpus 1 -v \
