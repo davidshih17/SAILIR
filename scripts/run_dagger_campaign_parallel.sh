@@ -27,8 +27,17 @@ STAMP=$(date +%Y%m%d_%H%M%S)
 RUN=results/dagger/round_$STAMP
 mkdir -p "$RUN" logs
 
+# The COLLECTION POLICY. DAgger requires rolling out the CURRENT policy: each
+# iteration corrects the distribution the latest model induces, so collecting
+# with a stale checkpoint would relabel the wrong state distribution. Recorded
+# in the run dir because the rows are only interpretable against the policy
+# that produced them.
+MODEL=${SAILIR_DAGGER_MODEL:-checkpoints/gravity3L_p101_bce/best_model.pt}
+export SAILIR_DAGGER_MODEL="$MODEL"
+
 echo "=== DAgger campaign $STAMP ==="
 echo "Command: $0 $*"
+echo "collection policy: $MODEL"
 echo "targets=$N workers=$W mode=$MODE  ->  $RUN"
 echo "cores=$(nproc) load=$(cut -d' ' -f1-3 /proc/loadavg)"
 
@@ -45,6 +54,12 @@ ls results/truth/closures/v5_p101_59k/out \
   | shuf -n "$N" --random-source=<(yes seed42) > "$RUN/targets.txt"
 echo "sampled $(wc -l < "$RUN/targets.txt") targets "\
      "(excluded $(wc -l < "$DONE") already walked)"
+echo "$MODEL" > "$RUN/collection_policy.txt"
+python3 -c "
+import torch,sys
+c=torch.load('$MODEL',map_location='cpu',weights_only=False)
+print(f'  policy epoch={c.get(\"epoch\")}')
+" 2>/dev/null || true
 
 # split into W shards
 split -n r/"$W" -d --additional-suffix=.txt "$RUN/targets.txt" "$RUN/shard_"

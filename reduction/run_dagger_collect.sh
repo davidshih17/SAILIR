@@ -20,7 +20,8 @@ export PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="" SAILIR_TOPOLOGY=gravity3L
 
 INT=$1; OUT=$2; MODE=${3:-errors}
 TAG=$(echo "$INT" | tr ',' '_')          # minus signs PRESERVED (doc §2)
-REGEN=results/truth/closures/regen/out
+# Overridable so an A/B can hide the regenerated closures without moving them.
+REGEN=${SAILIR_REGEN_DIR:-results/truth/closures/regen/out}
 MISSING=${SAILIR_DAGGER_MISSING:-results/truth/closures/regen/missing_targets.txt}
 # Per-worker log. Parallel shards MUST NOT share one: beam rows are multi-KB,
 # far over PIPE_BUF, so concurrent appends interleave mid-line.
@@ -52,7 +53,8 @@ export SAILIR_DAGGER_MISSING="$MISSING"
 
 python -u reduction/beam_search_v9.py \
     --topology topology_input/gravity3L \
-    --model checkpoints/gravity3L_p101_bce/best_model.pt \
-    --integral "$INT" --prime 101 --beam-width 20 --max-steps 40 \
+    --model "${SAILIR_DAGGER_MODEL:-checkpoints/gravity3L_p101_bce/best_model.pt}" \
+    --integral "$INT" --prime 101 \
+    --beam-width "${SAILIR_BEAM_WIDTH:-20}" --max-steps "${SAILIR_MAX_STEPS:-40}" \
     --max-actions 1000 \
     --output /tmp/dagger_$TAG.pkl >> "$LOGF" 2>&1 || true
