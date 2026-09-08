@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """onestep_worker_v8.py
 =================================================================
-Hierarchical-reduction worker that runs `greedy_p9.beam_search_v5`
+Hierarchical-reduction worker that runs `greedy_reduce.greedy_reduce`
 IN-PROCESS — exactly the way onestep_worker_v6.py runs v6, and exactly the way
-the verified probes ran `python greedy_p9.py --n-threads 8 --n-workers 8`.
+the verified probes ran `python greedy_reduce.py --n-threads 8 --n-workers 8`.
 
 WHY IN-PROCESS (and not a subprocess wrapper):
-  A single process means greedy_p9's import-time _cap_incidental_threads()
+  A single process means greedy_reduce's import-time _cap_incidental_threads()
   runs in THIS process and confines it + its 8 forked enumerate workers to 8
   cores — byte-for-byte the CPU behavior the probes verified (8/8, zero holds).
   There is no pickle round-trip (so no `ModuleNotFoundError: sailir`), no stdout
@@ -14,7 +14,7 @@ WHY IN-PROCESS (and not a subprocess wrapper):
   orchestrator-format result.pkl is written directly (so reaping just works).
 
 v7 SETTINGS reproduced (== the success-only probe recipe):
-  ENV (set BELOW, before importing greedy_p9, because _SUCCESS_TOTAL /
+  ENV (set BELOW, before importing greedy_reduce, because _SUCCESS_TOTAL /
        _BEAM_TOTAL / _ACTION_SELECT are read at module import):
        SAILIR_SUCCESS_TOTAL=1  SAILIR_ACTION_SELECT=maxweight
        SAILIR_STRIP_RAWS=1  SAILIR_PACKED_RS=1  SAILIR_END_OF_STEP_TRIM=1
@@ -23,7 +23,7 @@ v7 SETTINGS reproduced (== the success-only probe recipe):
   ARGV injection: --n-threads 8 --n-workers 8 prepended so the import-time
        _cap_incidental_threads() (which peeks sys.argv) applies the 8/8 thread
        caps + MKL GNU layer + 8-core affinity pin, identical to the probe.
-  beam_search_v5 call: tabu=True, use_exprkeyed=False, iraws_keep_first=50,
+  greedy_reduce call: tabu=True, use_exprkeyed=False, iraws_keep_first=50,
        lazy_rs=True, max_actions=900, beam_sort='weight', model_batch_chunk=8,
        n_workers=8 (the fork pool).
 
@@ -35,7 +35,7 @@ unchanged. Output keys match the orchestrator contract:
 import os
 import sys
 
-# ── v7 toggles: MUST be set before importing greedy_p9 (module-level
+# ── v7 toggles: MUST be set before importing greedy_reduce (module-level
 #    _SUCCESS_TOTAL/_BEAM_TOTAL/_ACTION_SELECT read os.environ at import). ──
 os.environ.setdefault('PYTHONUNBUFFERED', '1')
 os.environ.setdefault('MALLOC_MMAP_THRESHOLD_', '67108864')
@@ -52,12 +52,12 @@ os.environ['SAILIR_PACKED_RS'] = '1'
 os.environ['SAILIR_SUCCESS_TOTAL'] = '1'
 # SAILIR_BEAM_TOTAL intentionally absent -> (r,s) beam + (r,s) maxweight.
 
-# ── argv injection so greedy_p9's import-time _cap_incidental_threads()
+# ── argv injection so greedy_reduce's import-time _cap_incidental_threads()
 #    sees the production 8/8 config and applies thread-caps + 8-core pin. It
 #    peeks sys.argv for --n-threads/--n-workers; our own parser uses
 #    parse_known_args() below so these extra flags are ignored. ──
 # CPU count from --v7-cpus (default 8). Peeked from sys.argv BEFORE importing
-# greedy_p9, because its import-time _cap_incidental_threads() reads the
+# greedy_reduce, because its import-time _cap_incidental_threads() reads the
 # injected --n-threads/--n-workers to size the affinity pin + thread caps.
 def _peek_v7_cpus(default=8):
     for i, a in enumerate(sys.argv):
@@ -76,7 +76,7 @@ def _peek_v7_cpus(default=8):
 
 N_THREADS = N_WORKERS = _peek_v7_cpus()
 # Cap BLAS/OpenMP pools to the slot size BEFORE any numpy import (the
-# symmetry-first block below imports sailir/numpy ahead of greedy_p9's
+# symmetry-first block below imports sailir/numpy ahead of greedy_reduce's
 # thread caps; an uncapped OpenBLAS pool would exceed RequestCpus -> hold).
 for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
     os.environ.setdefault(_v, str(N_THREADS))
@@ -96,7 +96,7 @@ sys.path.insert(0, str(_HERE.parent))   # .../SAILIR_phase2 (repo root) for `sai
 sys.path.insert(0, str(_HERE))          # .../reduction for sibling modules
 
 # ── SYMMETRY-FIRST (2026-07-31): routing on the same footing as SAILIR. ──
-# Before paying the greedy_p9/torch import + model load, try the symmetry
+# Before paying the greedy_reduce/torch import + model load, try the symmetry
 # route solve on the target. A non-None rule IS a valid one-step reduction
 # (strictly descending in the total order by construction) and becomes this
 # worker's result in seconds. None -> fall through to the full SAILIR path
@@ -166,7 +166,7 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         print(f'[sym-first] error ({_e}) — falling through to beam search',
               flush=True)
 
-# Import greedy_p9 FIRST. Its module top runs _cap_incidental_threads()
+# Import greedy_reduce FIRST. Its module top runs _cap_incidental_threads()
 # (thread caps + 8-core affinity pin) BEFORE it (internally) imports numpy/torch,
 # so torch's threadpool is created already-pinned to 8 cores.
 #
@@ -174,11 +174,11 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
 # any threads created AFTERWARD. If torch (or sailir.classifier, which imports
 # torch) is imported BEFORE this, torch spins up its threadpool across ALL cores,
 # and the later main-thread-only pin canNOT reclaim those threads -> total CPU
-# exceeds RequestCpus -> Condor holds the job. So greedy_p9 (hence its
+# exceeds RequestCpus -> Condor holds the job. So greedy_reduce (hence its
 # torch) must load before any other torch-importing module. This mirrors the
-# standalone greedy_p9.py order (_cap_incidental_threads() then import torch).
-import greedy_p9 as bs7
-from greedy_p9 import (beam_search_v5, replay_full_expr, _is_success,
+# standalone greedy_reduce.py order (_cap_incidental_threads() then import torch).
+import greedy_reduce as greedy
+from greedy_reduce import (greedy_reduce, replay_full_expr, _is_success,
                             _target_key, max_w12)
 import torch
 from sailir import ibp_env
@@ -218,7 +218,7 @@ def main():
     # parse_known_args: tolerate the injected --n-threads/--n-workers flags.
     args, _unknown = p.parse_known_args()
 
-    # ── replicate greedy_p9.main()'s setup VERBATIM ──────────────────
+    # ── replicate greedy_reduce.main()'s setup VERBATIM ──────────────────
     torch.set_num_threads(N_THREADS)
     if (os.environ.get('SAILIR_CAP_INTEROP', '1') != '0'
             and (N_THREADS > 1 or N_WORKERS > 1)):
@@ -230,10 +230,10 @@ def main():
     t0 = time.time()
     topology = Topology.from_dir(args.topology)
     ibp_env.init_from_topology(topology)
-    assert topology.n_denominators == bs7._TC_N_DEN, (
+    assert topology.n_denominators == greedy._TC_N_DEN, (
         f"topology has {topology.n_denominators} denominators but "
         f"SAILIR_TOPOLOGY={os.environ.get('SAILIR_TOPOLOGY', 'pentagonbox')!r} "
-        f"configures {bs7._TC_N_DEN} — set SAILIR_TOPOLOGY to match --topology")
+        f"configures {greedy._TC_N_DEN} — set SAILIR_TOPOLOGY to match --topology")
     set_prime(args.prime)
     set_paper_masters_only(args.paper_masters_only)
     if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
@@ -245,10 +245,10 @@ def main():
         apply_canonical_masters()
     env = IBPEnvironment()
 
-    # v7 module globals that greedy_p9.main() sets (replicate exactly).
-    bs7._V7_REGISTRY = bs7.IntegralRegistry()
-    bs7._V7_PACKED_RS_CACHE = {}
-    bs7._PACKED_RS = (os.environ.get('SAILIR_PACKED_RS', '0') == '1')
+    # v7 module globals that greedy_reduce.main() sets (replicate exactly).
+    greedy._V7_REGISTRY = greedy.IntegralRegistry()
+    greedy._V7_PACKED_RS_CACHE = {}
+    greedy._PACKED_RS = (os.environ.get('SAILIR_PACKED_RS', '0') == '1')
 
     # Variant-aware model construction (checkpoints/<name>/README.md): the
     # canon10x retrain is the `nosubs` variant (IBPActionClassifierNoSubs) —
@@ -344,16 +344,16 @@ def main():
     start_int = tuple(int(x) for x in integral_str.split(','))
     start_w = weight(start_int)
     start_w12 = (start_w[0], start_w[1])
-    bs7._START_TOTAL_KEY = _target_key(start_int)         # SAILIR_SUCCESS_TOTAL=1
-    bs7._START_SECTOR = bs7._sector_mask(start_int)       # SAILIR_SECTOR_RANK=1 bucket
+    greedy._START_TOTAL_KEY = _target_key(start_int)         # SAILIR_SUCCESS_TOTAL=1
+    greedy._START_SECTOR = greedy._sector_mask(start_int)       # SAILIR_SECTOR_RANK=1 bucket
     if os.environ.get('SAILIR_SYM_DROP', '0') == '1':
         # DO NOT ENABLE IN PRODUCTION — measured null result (locked 2026-07-11):
         # fired 352x on m1/m2/m3 A/B, shortened nothing, cost worker CPU.
-        # See the banner in greedy_p9.py. Kept for retrain-era experiments.
-        bs7._init_sym_drop(start_int)                     # same-(r,s) drop detector
+        # See the banner in greedy_reduce.py. Kept for retrain-era experiments.
+        greedy._init_sym_drop(start_int)                     # same-(r,s) drop detector
     if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0':
         # Keep the ACTION side stripped the same way as the expression. With
-        # bs7._STRIP_TOTAL on, the expression drops terms below the start in the
+        # greedy._STRIP_TOTAL on, the expression drops terms below the start in the
         # FULL total order, so the raws must too -- otherwise every enumerated
         # action keeps regenerating exactly the terms the expression discards.
         # get_raw_equation reads a 3-tuple as the total-ordering threshold, and
@@ -366,7 +366,7 @@ def main():
             # (den-row backward) actions. Under the legacy (r,s) order an
             # out-of-cone sub-weight term IS below the start, so the plain
             # strip remains correct there (bit-identical legacy behavior).
-            ibp_env.set_raw_strip_cone(bs7._sector_mask(start_int))
+            ibp_env.set_raw_strip_cone(greedy._sector_mask(start_int))
     target_sector = tuple(get_sector_mask(start_int))
     start_expr = {start_int: 1}
 
@@ -379,13 +379,13 @@ def main():
               f'target_sector={target_sector}', flush=True)
         print(f'[v7-worker] max_steps={args.max_steps} '
               f'n_threads={N_THREADS} '
-              f'SUCCESS_TOTAL={bs7._SUCCESS_TOTAL} '
+              f'SUCCESS_TOTAL={greedy._SUCCESS_TOTAL} '
               f'BEAM_SORT={os.environ.get("SAILIR_BEAM_SORT","weight")} '
               f'NM_PEN={os.environ.get("SAILIR_NM_PENALTY","0.0")} '
               f'raw_strip_thr={ibp_env.get_raw_strip_threshold()}',
               flush=True)
 
-    beam, best_state = beam_search_v5(
+    beam, best_state = greedy_reduce(
         env, model, start_expr, target_sector, start_w12,
         max_steps=args.max_steps,
         device=args.device,
@@ -406,7 +406,7 @@ def main():
     n_steps = len(path)
 
     # Full expression (passengers + masters) via path replay, exactly as
-    # greedy_p9.main() does for its --output.
+    # greedy_reduce.main() does for its --output.
     full = replay_full_expr(start_expr, best_state.path, env)
     full_expr = full[0] if full else dict(best_state.expr)
 
@@ -455,7 +455,7 @@ def main():
 
     if args.verbose:
         status = 'SUCCESS' if success else 'INCOMPLETE'
-        drops = sum(1 for v in bs7._drop_memo.values() if v) if bs7._drop_memo else 0
+        drops = sum(1 for v in greedy._drop_memo.values() if v) if greedy._drop_memo else 0
         print(f'[v7-worker] {status} in {elapsed:.2f}s path_len={n_steps} '
               f'nm={best_state.n_non_masters} sym_drops={drops} '
               f'peak_rss={peak_rss_kb/1024:.0f}MB '

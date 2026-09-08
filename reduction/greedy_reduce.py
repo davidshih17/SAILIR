@@ -9,7 +9,7 @@
 # =========================================================================
 """v6 beam search: macro-beam architecture on top of v5 strip-passenger.
 
-Built from v5 (`beam_search_v5.py`). v5 wastes beam capacity because:
+Built from v5 (`greedy_reduce.py`). v5 wastes beam capacity because:
   - The model only sees expr + RS_KEYS (not RS values; see prepare_batched
     _input_v5_dummy). When 40 beam states share the same expr_fp and share
     ~249/250 RS keys (as empirical inspection of probe_84_v5_lazyrs at step
@@ -1732,7 +1732,7 @@ if _bad:
         + '\nThese flags change the ALGORITHM, not just performance.')
 
 
-def beam_search_v5(env, model, start_expr, target_sector, start_w12,
+def greedy_reduce(env, model, start_expr, target_sector, start_w12,
                    max_steps=1000, device='cpu',
                    max_actions=1000, ckpt_path=None,
                    ckpt_every=50, verbose=True,

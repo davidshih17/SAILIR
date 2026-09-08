@@ -57,7 +57,7 @@ mkdir -p $D/out $D/ckpt/$1 $D/logs
 #   SAILIR_BEAM_WALL  wall clock, default 1800s. The known solve took 10.6s.
 #   SAILIR_MAX_STEPS  step cap, default 50000 (= the previous hardcoded value,
 #                     so existing .sub files are unchanged).
-# Memory has NO in-process cap in onestep_worker_p9.py (unlike the walk
+# Memory has NO in-process cap in greedy_worker.py (unlike the walk
 # worker), so it is bounded by the Condor reservation + periodic_hold instead.
 #
 # `timeout` execs its command directly, so an inline VAR=VAL in front of the
@@ -66,7 +66,7 @@ mkdir -p $D/out $D/ckpt/$1 $D/logs
 export PYTHONUNBUFFERED=1
 exec timeout "${SAILIR_BEAM_WALL:-1800}" \
   /het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python -u \
-  $B/reduction/onestep_worker_p9.py \
+  $B/reduction/greedy_worker.py \
   --topology $B/topology_input/gravity3L \
   --integral="$(echo "$1" | tr '_' ',')" \
   --output $D/out/$1.pkl \
