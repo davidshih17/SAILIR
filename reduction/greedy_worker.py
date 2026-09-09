@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
-"""onestep_worker_v8.py
-=================================================================
-Hierarchical-reduction worker that runs `greedy_reduce.greedy_reduce`
-IN-PROCESS — exactly the way onestep_worker_v6.py runs v6, and exactly the way
-the verified probes ran `python greedy_reduce.py --n-threads 8 --n-workers 8`.
+"""greedy_worker.py — the certified greedy width-1 worker.
 
-WHY IN-PROCESS (and not a subprocess wrapper):
-  A single process means greedy_reduce's import-time _cap_incidental_threads()
-  runs in THIS process and confines it + its 8 forked enumerate workers to 8
-  cores — byte-for-byte the CPU behavior the probes verified (8/8, zero holds).
-  There is no pickle round-trip (so no `ModuleNotFoundError: sailir`), no stdout
-  buffering (so the .out shows live progress and survives a kill), and the
-  orchestrator-format result.pkl is written directly (so reaping just works).
+Runs `greedy_reduce.greedy_reduce` IN-PROCESS. A single process means
+greedy_reduce's import-time _cap_incidental_threads() runs HERE, so the thread
+caps and CPU affinity pin apply to the process that does the work. There is no
+pickle round-trip (so no `ModuleNotFoundError: sailir`), no stdout buffering
+(so the .out shows live progress and survives a kill), and the
+orchestrator-format result.pkl is written directly (so reaping just works).
 
-v7 SETTINGS reproduced (== the success-only probe recipe):
-  ENV (set BELOW, before importing greedy_reduce, because _SUCCESS_TOTAL /
-       _BEAM_TOTAL / _ACTION_SELECT are read at module import):
-       SAILIR_SUCCESS_TOTAL=1  SAILIR_ACTION_SELECT=maxweight
-       SAILIR_STRIP_RAWS=1  SAILIR_PACKED_RS=1  SAILIR_END_OF_STEP_TRIM=1
-       SAILIR_TABU_CAP=0  MALLOC_MMAP_THRESHOLD_=67108864  PYTHONUNBUFFERED=1
-       (SAILIR_BEAM_TOTAL deliberately UNSET -> (r,s) beam + (r,s) maxweight)
-  ARGV injection: --n-threads 8 --n-workers 8 prepended so the import-time
-       _cap_incidental_threads() (which peeks sys.argv) applies the 8/8 thread
-       caps + MKL GNU layer + 8-core affinity pin, identical to the probe.
-  greedy_reduce call: tabu=True, use_exprkeyed=False, iraws_keep_first=50,
-       lazy_rs=True, max_actions=900, beam_sort='weight', model_batch_chunk=8,
-       n_workers=8 (the fork pool).
+CONFIGURATION IS ENFORCED, NOT DOCUMENTED
+  greedy_reduce aborts AT IMPORT unless all eight of these hold, and an UNSET
+  one aborts too (unset SAILIR_SECTOR_RANK means rank 0 -- a different total
+  order, so a different search):
 
-CLI mirrors onestep_worker_v6.py so hierarchical_reduction.py dispatches to it
-unchanged. Output keys match the orchestrator contract:
+    SAILIR_SUCCESS_TOTAL=1  SAILIR_BEAM_TOTAL=1  SAILIR_SECTOR_RANK=1
+    SAILIR_PACKED_RS=1      SAILIR_STRIP_RAWS=1  SAILIR_V9_UPENUM=1
+    SAILIR_V9_CULL=1        SAILIR_NM_PENALTY=0.1
+
+  This file sets the ones it can (below); the rest come from the wrapper or,
+  under the orchestrator, from the pinned environment in
+  hierarchical_reduction.greedy_env_string(). Do not describe the config in
+  prose and hope -- if it is wrong, the job dies immediately and says so.
+
+  Separately, greedy_reduce refuses any max_actions != 1000: the cull cap
+  decides which candidates the model ever sees.
+
+--v7-cpus IS LOAD-BEARING (default 8)
+  Our parser is parse_known_args(), so unknown flags -- including --beam_width
+  and --no-tabu from the v7/v9 arg builder -- are silently ignored. --v7-cpus
+  is NOT one of them: it is peeked out of sys.argv BEFORE greedy_reduce is
+  imported, to size the thread caps and affinity pin. Omitting it yields an
+  8-core pin inside a 1-CPU Condor slot. Pass --v7-cpus 1.
+
+NOT PRESENT (stripped from beam_search_v9, do not reintroduce)
+  tabu, iraws, beam width/sort, the fork pool, SAILIR_ACTION_SELECT. The
+  search keeps ONE state per step; the 20-wide fan-out inside a step exists
+  only because the selection key needs nm, which is observable only AFTER an
+  action is applied.
+
+Output keys match the orchestrator contract:
   success, original_integral, final_expr, path, restart_offsets, steps, time,
   prime, peak_memory_kb.
 """
@@ -177,6 +187,17 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
 # exceeds RequestCpus -> Condor holds the job. So greedy_reduce (hence its
 # torch) must load before any other torch-importing module. This mirrors the
 # standalone greedy_reduce.py order (_cap_incidental_threads() then import torch).
+# Snapshot the environment the SEARCH actually sees -- taken here, AFTER this
+# file's own setdefault/assignment block and BEFORE greedy_reduce is imported
+# (its module-level constants are read at that import). This is the certified
+# configuration as a FACT captured from a real run, not a list reconstructed by
+# reading three files and hoping. reduction/greedy_certified.json is frozen
+# from it, and it rides along in every result.pkl so any run can be audited
+# after the fact.
+_ENV_SNAPSHOT = {k: v for k, v in os.environ.items()
+                 if k.startswith(('SAILIR_', 'OMP_', 'MKL_', 'MALLOC_',
+                                  'OPENBLAS_', 'NUMEXPR_'))}
+
 import greedy_reduce as greedy
 from greedy_reduce import (greedy_reduce, replay_full_expr, _is_success,
                             _target_key, max_w12)
@@ -439,6 +460,8 @@ def main():
         'time': elapsed,
         'prime': args.prime,
         'peak_memory_kb': peak_rss_kb,
+        # the exact env this run used -- see _ENV_SNAPSHOT above
+        'env_snapshot': _ENV_SNAPSHOT,
         'best_n_non_masters': best_state.n_non_masters,
         # DUAL beam only: WHICH sub-beam produced the winning state. 0 =
         # weight-sorted lane, 1 = prob-sorted lane. Without it the run shows

@@ -111,6 +111,111 @@ def work_units(integrals):
     return total
 
 
+# --------------------------------------------------------------------------
+# GREEDY worker dispatch (SAILIR_WORKER_GREEDY=1)
+#
+# greedy_worker.py runs reduction/greedy_reduce.py, the stripped width-1 build
+# certified 125/125 bit-identical. It needs its own arg builder, though NOT
+# because the v7/v9 line would crash it -- it parses with parse_known_args(),
+# so --beam_width and --no-tabu are silently IGNORED rather than rejected.
+# The reason is --v7-cpus, which is worse than ignored: greedy_worker.py PEEKS
+# it out of sys.argv before importing greedy_reduce, to size the thread caps
+# and the CPU affinity pin, and it DEFAULTS TO 8. Omit it and a worker takes an
+# 8-core pin inside a 1-CPU Condor slot -> over-subscription and a hold. The
+# certified wrapper passes --v7-cpus 1, so this does too.
+# --beam_width is dropped because there is no beam left to size.
+#
+# The env is PINNED, not forwarded. greedy_reduce refuses to start unless all
+# eight of these hold, and an UNSET var fails too (unset SAILIR_SECTOR_RANK
+# means rank 0 -- a different total order, i.e. a different search). Forwarding
+# "whatever the orchestrator happens to have" is how a run silently becomes a
+# configuration nobody validated: run_gr_hard_g1023_greedy.sh, for instance,
+# exports SAILIR_NM_PENALTY=0, while the certified build is 0.1.
+#
+# Pinning alone would SILENTLY override that 0, so a conflicting value is a
+# hard error instead. One configuration, no silent deviation.
+# PERFORMANCE, not semantics: the raw-equation LRU. The default cap thrashes
+# once |iraws| exceeds it -- a measured ~20x cliff -- so the certified wrapper
+# raises it. Results are identical either way, which is exactly why it is not
+# in greedy_reduce's guard and must not be forgotten here.
+_GREEDY_CERT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'greedy_certified.json')
+with open(_GREEDY_CERT_PATH) as _f:
+    _GREEDY_CERT = json.load(_f)
+
+
+def _cert_keys(*secs):
+    return {k: v for sec in secs
+            for k, v in _GREEDY_CERT.get(sec, {}).items()
+            if not k.startswith('_')}
+
+
+# Read from the record, never re-typed here: greedy_reduce validates against
+# the SAME file, so the two cannot drift apart.
+_GREEDY_ENV = _cert_keys('env_set', 'env_model')
+_GREEDY_PERF_ENV = _cert_keys('env_set_perf')
+_GREEDY_MUST_UNSET = _GREEDY_CERT.get('env_must_be_unset', {}).get('names', [])
+_GREEDY_CERTIFIED = _cert_keys('cli')
+
+
+def greedy_selected():
+    return os.environ.get('SAILIR_WORKER_GREEDY') == '1'
+
+
+def greedy_check_certified(prime, v7_cpus, model_checkpoint):
+    """Refuse a greedy dispatch that is not the certified model+prime pair."""
+    bad = []
+    if prime != _GREEDY_CERTIFIED['prime']:
+        bad.append(f'  --prime {prime}  (certified {_GREEDY_CERTIFIED["prime"]}) '
+                   f'-- WRONG PRIME IS SILENT: no error, just wrong coefficients')
+    if v7_cpus != _GREEDY_CERTIFIED['v7_cpus']:
+        bad.append(f'  --v7-cpus {v7_cpus}  (certified '
+                   f'{_GREEDY_CERTIFIED["v7_cpus"]}) -- sizes the CPU pin')
+    tail = _GREEDY_CERTIFIED['checkpoint_tail']
+    if not str(model_checkpoint).replace('\\', '/').endswith(tail):
+        bad.append(f'  --model-checkpoint {model_checkpoint}\n'
+                   f'      (certified .../{tail}); the prime above is correct '
+                   f'ONLY for that checkpoint')
+    if bad:
+        raise SystemExit(
+            'SAILIR_WORKER_GREEDY=1 but this is not the certified '
+            'configuration:\n' + '\n'.join(bad) +
+            '\nThe greedy build was validated 125/125 against exactly this '
+            'model at this\nprime. Fix the command line, or run the v9 worker, '
+            'which is general.')
+
+
+def greedy_env_string():
+    """The pinned worker env, or a hard error if our own env contradicts it."""
+    bad = {k: os.environ[k] for k, v in _GREEDY_ENV.items()
+           if os.environ.get(k) not in (None, v)}
+    if bad:
+        raise SystemExit(
+            'SAILIR_WORKER_GREEDY=1 but this orchestrator env contradicts the\n'
+            'certified greedy configuration:\n' +
+            ''.join(f'  {k}={v!r}  (certified {_GREEDY_ENV[k]!r})\n'
+                    for k, v in sorted(bad.items())) +
+            'Unset these, or run the v9 worker instead. They are pinned rather\n'
+            'than forwarded so a greedy run is always the validated search.')
+    env = dict(_GREEDY_ENV)
+    # perf knob: honour an explicit override, else pin the certified value
+    for k, v in _GREEDY_PERF_ENV.items():
+        env[k] = os.environ.get(k, v)
+    return ' '.join(f'{k}={v}' for k, v in env.items())
+
+
+def greedy_worker_args(topology_dir, integral_str, output_file,
+                       model_checkpoint, max_steps, prime, v7_cpus,
+                       paper_masters_flag, resume_flag):
+    """The greedy CLI: --v7-cpus kept (it sizes the pin), --beam_width dropped."""
+    return (f' --topology {topology_dir} --integral=\'{integral_str}\''
+            f' --output {output_file}'
+            f' --model-checkpoint {model_checkpoint}'
+            f' --max_steps {max_steps}'
+            f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+            f'{paper_masters_flag}{resume_flag}')
+
+
 def create_condor_submit(work_dir, integral, job_name, output_file,
                          model_checkpoint, beam_width, max_steps, prime,
                          topology_dir,
@@ -205,18 +310,27 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
         # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
         # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
         # configuration validated at 125/125 and 300/300.
-        worker_script = ('onestep_worker_v9.py'
-                         if os.environ.get('SAILIR_WORKER_V9') == '1'
-                         else 'onestep_worker_v7.py')
-        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
-                       f' --output {output_file}'
-                       f' --model-checkpoint {model_checkpoint}'
-                       f' --beam_width {beam_width} --max_steps {max_steps}'
-                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}'
-                       # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
-                       # with no env equivalent, notably --no-tabu.
-                       f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
+        if greedy_selected():
+            # model+prime pair, checked here because the env guard cannot see
+            # CLI values -- a wrong prime is silent and passes every other check
+            greedy_check_certified(prime, v7_cpus, model_checkpoint)
+            worker_script = 'greedy_worker.py'
+            worker_args = greedy_worker_args(
+                topology_dir, integral_str, output_file, model_checkpoint,
+                max_steps, prime, v7_cpus, paper_masters_flag, resume_flag)
+        else:
+            worker_script = ('onestep_worker_v9.py'
+                             if os.environ.get('SAILIR_WORKER_V9') == '1'
+                             else 'onestep_worker_v7.py')
+            worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                           f' --output {output_file}'
+                           f' --model-checkpoint {model_checkpoint}'
+                           f' --beam_width {beam_width} --max_steps {max_steps}'
+                           f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+                           f'{paper_masters_flag}{resume_flag}'
+                           # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
+                           # with no env equivalent, notably --no-tabu.
+                           f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
@@ -272,11 +386,20 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
     # measured, that variant logs p_top=0.0 at states where the model is at
     # 0.9999 and drives nm to 15. It must be forwarded explicitly.
-    for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
-               'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
-        if os.environ.get(_v) is not None:
-            _envs = (_envs + " " if _envs else "") + \
-                f"{_v}={os.environ[_v]}"
+    if greedy_selected():
+        # PINNED, not forwarded: greedy_reduce refuses to start outside this
+        # exact set, and an UNSET var fails too. Skip names already emitted
+        # above so a key is never assigned twice in one environment line.
+        _have = {kv.split('=', 1)[0] for kv in _envs.split()}
+        _pin = ' '.join(kv for kv in greedy_env_string().split()
+                        if kv.split('=', 1)[0] not in _have)
+        _envs = (_envs + " " if _envs else "") + _pin
+    else:
+        for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
+                   'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
+            if os.environ.get(_v) is not None:
+                _envs = (_envs + " " if _envs else "") + \
+                    f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -350,18 +473,27 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
         # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
         # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
         # configuration validated at 125/125 and 300/300.
-        worker_script = ('onestep_worker_v9.py'
-                         if os.environ.get('SAILIR_WORKER_V9') == '1'
-                         else 'onestep_worker_v7.py')
-        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
-                       f' --output {output_file}'
-                       f' --model-checkpoint {model_checkpoint}'
-                       f' --beam_width {beam_width} --max_steps {max_steps}'
-                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                       f'{paper_masters_flag}{resume_flag}'
-                       # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
-                       # with no env equivalent, notably --no-tabu.
-                       f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
+        if greedy_selected():
+            # model+prime pair, checked here because the env guard cannot see
+            # CLI values -- a wrong prime is silent and passes every other check
+            greedy_check_certified(prime, v7_cpus, model_checkpoint)
+            worker_script = 'greedy_worker.py'
+            worker_args = greedy_worker_args(
+                topology_dir, integral_str, output_file, model_checkpoint,
+                max_steps, prime, v7_cpus, paper_masters_flag, resume_flag)
+        else:
+            worker_script = ('onestep_worker_v9.py'
+                             if os.environ.get('SAILIR_WORKER_V9') == '1'
+                             else 'onestep_worker_v7.py')
+            worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                           f' --output {output_file}'
+                           f' --model-checkpoint {model_checkpoint}'
+                           f' --beam_width {beam_width} --max_steps {max_steps}'
+                           f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+                           f'{paper_masters_flag}{resume_flag}'
+                           # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
+                           # with no env equivalent, notably --no-tabu.
+                           f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
     elif use_v6_worker:
         worker_script = 'onestep_worker_v6.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
@@ -420,11 +552,20 @@ def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps
     # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
     # measured, that variant logs p_top=0.0 at states where the model is at
     # 0.9999 and drives nm to 15. It must be forwarded explicitly.
-    for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
-               'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
-        if os.environ.get(_v) is not None:
-            _envs = (_envs + " " if _envs else "") + \
-                f"{_v}={os.environ[_v]}"
+    if greedy_selected():
+        # PINNED, not forwarded: greedy_reduce refuses to start outside this
+        # exact set, and an UNSET var fails too. Skip names already emitted
+        # above so a key is never assigned twice in one environment line.
+        _have = {kv.split('=', 1)[0] for kv in _envs.split()}
+        _pin = ' '.join(kv for kv in greedy_env_string().split()
+                        if kv.split('=', 1)[0] not in _have)
+        _envs = (_envs + " " if _envs else "") + _pin
+    else:
+        for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
+                   'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
+            if os.environ.get(_v) is not None:
+                _envs = (_envs + " " if _envs else "") + \
+                    f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     parts = [f"""universe = vanilla
 executable = {PYTHON_PATH}

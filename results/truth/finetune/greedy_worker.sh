@@ -19,26 +19,25 @@
 #   $1 = target tag   $2 = beam_sort mode   $3 = beam width
 set -u
 B=/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2
-# SAILIR_BEAM_SORT removed: no beam_sort parameter remains
-# Overridable. Default 'decay' keeps every existing .sub byte-identical.
-# SAILIR_SCORE=local scores a state by the log-probability of the LAST
-# action only. MEASURED reason to want it: with tabu off, at depth 9 the
-# whole beam ties at max_w12 [10,1], so the score tiebreak decides alone --
-# and the truth path loses on a decayed debt from its depth-2 step
-# (p=0.0025, ~6 nats, still ~1.3 after decay) despite its CURRENT move
-# being rank 2 at p=0.113. Local scoring drops the debt.
-# SAILIR_SCORE removed: score mode folded to local
-# Overridable. Default 0.1 keeps every existing .sub byte-identical.
-# THIS LINE WAS UNCONDITIONAL until 2026-09-07 and silently overrode
-# SAILIR_NM_PENALTY set in the submit file -- so the 125/125 and 300/300
-# greedy runs, which I described as 'plain argmax', actually selected on
-# (action log-prob - 0.1 * n_non_masters). Their banners say NM_PEN=0.1.
-export SAILIR_NM_PENALTY=${SAILIR_NM_PENALTY:-0.1}
-# SAILIR_TOP_K removed: top_k=20 is now a real parameter default
-export SAILIR_V9_CULL=1
-export SAILIR_V9_UPENUM=1
-export SAILIR_RAW_EQ_CACHE_CAP=1000000000
-export SAILIR_TOPOLOGY=gravity3L SAILIR_SECTOR_RANK=1
+PYBIN=/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
+# ── CERTIFIED CONFIGURATION: read from the record, never re-typed here ──
+# reduction/greedy_certified.json is the single source of truth, shared with
+# greedy_reduce.py (which aborts at import if the env is wrong) and
+# hierarchical_reduction.py (which pins the same env into every Condor submit).
+# This wrapper used to carry its own hand-maintained copy of the exports, the
+# prime, the cpu count and the checkpoint -- a third copy that could drift from
+# the other two with nothing comparing them.
+#
+# --unset matters as much as --export: it clears every variable the certified
+# run had UNSET, so one inherited from the submitting shell cannot leak in.
+# SAILIR_SYM_FIRST=1 in particular would make the worker return a symmetry rule
+# with steps=0 and never run the search, while every exported value stayed right.
+eval "$($PYBIN $B/scripts/greedy_env.py --unset)"
+eval "$($PYBIN $B/scripts/greedy_env.py --export)"
+eval "$($PYBIN $B/scripts/greedy_env.py --cli)"
+
+# Campaign knobs, deliberately NOT in the record: they bound how long a run may
+# take, never which path it walks.
 export SAILIR_KEEP_CKPT_EVERY=100
 ARM=$2$3
 
@@ -70,10 +69,10 @@ exec timeout "${SAILIR_BEAM_WALL:-1800}" \
   --topology $B/topology_input/gravity3L \
   --integral="$(echo "$1" | tr '_' ',')" \
   --output $D/out/$1.pkl \
-  --model-checkpoint $B/checkpoints/gravity3L_p101_scratch/best_model.pt \
+  --model-checkpoint $B/$GREEDY_CKPT \
   --checkpoint-path $D/ckpt/$1/ckpt.pkl \
   --checkpoint-interval 100 \
-  --beam_width $3 --max_steps ${SAILIR_MAX_STEPS:-50000} --prime 101 --v7-cpus 1 -v \
+  --beam_width $3 --max_steps ${SAILIR_MAX_STEPS:-50000} --prime $GREEDY_PRIME --v7-cpus $GREEDY_V7_CPUS -v \
   ${SAILIR_EXTRA_FLAGS:-}
 # SAILIR_EXTRA_FLAGS is EMPTY by default, so every existing .sub that uses
 # this worker runs byte-identically. It exists so a flag that has no env

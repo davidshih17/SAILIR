@@ -33,6 +33,7 @@ What we keep from v5:
 import argparse
 import math
 import operator
+import json
 import os
 import pickle
 import re
@@ -1703,25 +1704,41 @@ def _v9_cull(valid, target, state, env, max_actions):
 #   worker  sets SUCCESS_TOTAL, PACKED_RS, STRIP_RAWS, END_OF_STEP_TRIM
 #   wrapper sets SECTOR_RANK, NM_PENALTY, V9_UPENUM, V9_CULL
 #   submit  sets BEAM_TOTAL
-# Operational knobs are deliberately NOT pinned: TOPOLOGY, MAX_STEPS,
-# BEAM_WALL, KEEP_CKPT_EVERY, NO_CPU_PIN, RAW_EQ_CACHE_CAP, V9_CULL_C.
-_VALIDATED = {
-    'SAILIR_SUCCESS_TOTAL': '1',   # success = no non-master at-or-above start
-    'SAILIR_BEAM_TOTAL':    '1',   # rank by the FULL (r, s, |a|) order
-    'SAILIR_SECTOR_RANK':   '1',   # sector rank is the senior key
-    'SAILIR_PACKED_RS':     '1',   # int32/int16 packed substitution store
-    'SAILIR_STRIP_RAWS':    '1',   # strip the action side like the expression
-    'SAILIR_V9_UPENUM':     '1',   # _tc_upenum_valid enumeration
-    'SAILIR_V9_CULL':       '1',   # the K=1000 cull
-    'SAILIR_NM_PENALTY':    '0.1', # log p - 0.1*nm selection
-}
+# THE certified configuration lives in reduction/greedy_certified.json, not
+# here. It used to be duplicated: this dict, and a copy in
+# hierarchical_reduction.py that pins the env written into every Condor submit.
+# Two hand-maintained copies of one list is a silent-drift bug waiting to
+# happen -- the orchestrator would pin one thing while this guard demanded
+# another, and nothing would compare them.
+#
+# The record itself was CAPTURED from a certified run (greedy_worker.py stores
+# os.environ in every result.pkl as 'env_snapshot'), not written from memory.
+_CERT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'greedy_certified.json')
+try:
+    with open(_CERT_PATH) as _f:
+        _CERT = json.load(_f)
+except (OSError, ValueError) as _e:
+    raise SystemExit(f'greedy: cannot read the certified record {_CERT_PATH}: '
+                     f'{_e}\nThe worker refuses to run without it -- an absent '
+                     f'record means nothing is pinned.')
+
+_VALIDATED = {k: v for sec in ('env_set', 'env_model')
+              for k, v in _CERT.get(sec, {}).items() if not k.startswith('_')}
+_MUST_UNSET = _CERT.get('env_must_be_unset', {}).get('names', [])
+
 # UNSET is a failure too, not a pass: an unset flag falls back to a source
 # default that may differ from the certified value (SAILIR_SECTOR_RANK unset
 # defaults to '0' = a DIFFERENT ordering). The caller must declare the
 # configuration explicitly.
 _bad = {k: os.environ.get(k) for k, v in _VALIDATED.items()
         if os.environ.get(k) != v}
-if _bad:
+# ...and the other half of the rule: a variable the certified run did NOT set.
+# Checking only the names in the list cannot catch SAILIR_SYM_FIRST=1, which
+# makes the worker return a symmetry rule with steps=0 and never run the search
+# at all -- while every value above is still correct.
+_leaked = {k: os.environ[k] for k in _MUST_UNSET if k in os.environ}
+if _bad or _leaked:
     raise SystemExit(
         'greedy: refusing to run outside the validated configuration.\n'
         + '\n'.join(f'  {k}={v!r} but this build is certified only at '
@@ -1729,7 +1746,11 @@ if _bad:
                      + (' (unset -> source default, which may differ)'
                         if v is None else '')
                      for k, v in sorted(_bad.items()))
-        + '\nThese flags change the ALGORITHM, not just performance.')
+        + ('\n' if _bad and _leaked else '')
+        + '\n'.join(f'  {k}={v!r} but the certified run had it UNSET'
+                     for k, v in sorted(_leaked.items()))
+        + f'\nThese flags change the ALGORITHM, not just performance.'
+        f'\nRecord: {_CERT_PATH}')
 
 
 def greedy_reduce(env, model, start_expr, target_sector, start_w12,
@@ -1742,7 +1763,8 @@ def greedy_reduce(env, model, start_expr, target_sector, start_w12,
                    ckpt_every_step=False,
                    lazy_rs=True,
                    model_batch_chunk=8,
-                   top_k=20):
+                   top_k=20,
+                   nm_penalty=0.1):
     """Sequential beam search, v5 strip-active semantics.
 
     n_workers: if >1, parallelize ONLY the per-step enumerate phase (P1) across
@@ -1763,6 +1785,20 @@ def greedy_reduce(env, model, start_expr, target_sector, start_w12,
             f'ONLY at the K=1000 cull that matches the training corpus. A\n'
             f'different cap feeds the model a different candidate list and\n'
             f'silently changes the search.')
+    # nm_penalty and top_k define the SELECTION RULE itself:
+    #   argmin over (-(log p - nm_penalty*nm), max_w12, nm)  across top_k children.
+    # Either one moved is a different search, not a tuned one, and it would
+    # fail silently -- every run still "succeeds", just along another path.
+    if nm_penalty != 0.1:
+        raise SystemExit(
+            f'greedy: nm_penalty={nm_penalty} but this build is certified ONLY\n'
+            f'at 0.1 (log p - 0.1*nm). The 125/125 run selected on this rule.')
+    if top_k != 20:
+        raise SystemExit(
+            f'greedy: top_k={top_k} but this build is certified ONLY at 20.\n'
+            f'top_k is the one-step lookahead width -- nm is observable only\n'
+            f'AFTER an action is applied, so this is how many children get\n'
+            f'built and scored before the argmin. It is not a beam.')
 
     resume_step = 0
     if resume_from is not None and os.path.exists(resume_from):
@@ -1868,7 +1904,11 @@ def greedy_reduce(env, model, start_expr, target_sector, start_w12,
     # and nm ratchets into the hundreds (frozen-7 divergence). Penalize each
     # active non-master by SAILIR_NM_PENALTY in log-prob units so states that
     # grow the bucket must buy it with genuinely better-ranked actions.
-    _nm_penalty = float(os.environ.get('SAILIR_NM_PENALTY', '0.0'))
+    # The PARAMETER, not the env var. SAILIR_NM_PENALTY stays in the import
+    # guard so a caller that sets it expecting an effect gets an abort rather
+    # than a silent no-op. Guard pins it to '0.1' == this default, so the
+    # certified path is unchanged by construction.
+    _nm_penalty = nm_penalty
 
     def sort_prob(s):
         # model-credited selection (2026-08-02): action log-prob first

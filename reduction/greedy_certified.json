@@ -1,0 +1,186 @@
+{
+  "_README": [
+    "THE certified configuration of the greedy width-1 worker. One record, read",
+    "by both greedy_reduce.py (which aborts at import) and",
+    "hierarchical_reduction.py (which pins the environment it writes into every",
+    "Condor submit). Before this file each kept its own copy of the same eight",
+    "variables -- if those ever drifted, the orchestrator would pin one thing",
+    "while the worker demanded another, and nothing would notice.",
+    "",
+    "PROVENANCE: env_set was CAPTURED from a real certified run, not written",
+    "from memory. greedy_worker.py snapshots os.environ after its own defaults",
+    "and before importing greedy_reduce, and stores it in every result.pkl as",
+    "'env_snapshot'. This record was frozen from cluster 1921442 on the target",
+    "1_1_0_1_1_1_1_3_2_1_0_0_0_0_0, which produced the certified steps=53.",
+    "Reconstructing this by reading source files got it wrong twice in one",
+    "sitting; capture does not have opinions.",
+    "",
+    "CERTIFICATION: 125/125 bit-identical (path, success, final_expr, steps)",
+    "against results/truth/finetune/gval, timing median 1.002x."
+  ],
+  "env_set": {
+    "_why": "Semantic. Wrong or missing -> a different search that still reports success.",
+    "SAILIR_SUCCESS_TOTAL": "1",
+    "SAILIR_BEAM_TOTAL": "1",
+    "SAILIR_SECTOR_RANK": "1",
+    "SAILIR_PACKED_RS": "1",
+    "SAILIR_STRIP_RAWS": "1",
+    "SAILIR_V9_UPENUM": "1",
+    "SAILIR_V9_CULL": "1",
+    "SAILIR_NM_PENALTY": "0.1",
+    "SAILIR_END_OF_STEP_TRIM": "1",
+    "SAILIR_TABU_CAP": "0"
+  },
+  "env_set_perf": {
+    "_why": "Speed only, results identical. Not guarded as semantics, but a wrong value is a ~20x cliff, so it is still recorded and pinned.",
+    "SAILIR_RAW_EQ_CACHE_CAP": "1000000000",
+    "MALLOC_MMAP_THRESHOLD_": "67108864"
+  },
+  "env_model": {
+    "_why": "Tied to the checkpoint, not to the search.",
+    "SAILIR_TOPOLOGY": "gravity3L"
+  },
+  "env_must_be_unset": {
+    "_why": [
+      "The closing rule, and the reason this record is a whitelist rather than",
+      "a list of knobs. A guard that only checks names it knows cannot catch",
+      "SAILIR_SYM_FIRST=1, which makes the worker return a symmetry rule with",
+      "steps=0 and never enter the greedy search at all. Every one of these was",
+      "UNSET in the captured certified environment, and unset is part of the",
+      "configuration.",
+      "Four of these were found only after the audit stopped using a hand-picked list of files and started following imports: they live in reduction/topo_config.py and reduction/eqact_infer.py, which the worker imports but which were outside the original scan. SAILIR_CANONICALIZE and SAILIR_CANON_MAPS_PKL override the topology's own canonicalization module and its map pickle -- i.e. they change what an integral canonicalizes TO, which is upstream of the entire search."
+    ],
+    "names": [
+      "SAILIR_SYM_FIRST",
+      "SAILIR_SYM_DROP",
+      "SAILIR_V9_ORACLE",
+      "SAILIR_V9_CULL_C",
+      "SAILIR_NO_CPU_PIN",
+      "SAILIR_NO_SECTOR_CACHE",
+      "SAILIR_PHASEA_LEGACY",
+      "SAILIR_P4_TPROBE",
+      "SAILIR_BEAM_SORT",
+      "SAILIR_COEFF_TABLE",
+      "SAILIR_EQ_MODE",
+      "SAILIR_EQ_CKPT",
+      "SAILIR_EQ_TIE",
+      "SAILIR_EQ_TERMS",
+      "SAILIR_EXPR_TERMS",
+      "SAILIR_CAP_INTEROP",
+      "SAILIR_CANONICALIZE",
+      "SAILIR_CANON_MAPS_PKL",
+      "SAILIR_ALLOW_DEFAULT_TOPOLOGY",
+      "SAILIR_EQ_STORE_CACHE"
+    ]
+  },
+  "env_free": {
+    "_why": "Deliberately variable per campaign. None changes the path taken on a solved target; they bound how long a run may take before it gives up. SAILIR_ROOT only relocates the repo path and falls back to the production literal; it selects no algorithm.",
+    "names": [
+      "SAILIR_MAX_STEPS",
+      "SAILIR_BEAM_WALL",
+      "SAILIR_KEEP_CKPT_EVERY",
+      "PYTHONUNBUFFERED",
+      "SAILIR_ROOT"
+    ]
+  },
+  "env_derived": {
+    "_why": "Set by the worker as a function of --v7-cpus, before any numpy import. Not independent handles; listed so the audit does not flag them.",
+    "names": [
+      "OMP_NUM_THREADS",
+      "OMP_THREAD_LIMIT",
+      "OPENBLAS_NUM_THREADS",
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
+      "MKL_THREADING_LAYER",
+      "OMP_WAIT_POLICY",
+      "SAILIR_SCORE"
+    ]
+  },
+  "params": {
+    "_why": "greedy_reduce() keyword arguments that define the selection rule. Each has an abort in greedy_reduce.",
+    "max_actions": 1000,
+    "nm_penalty": 0.1,
+    "top_k": 20
+  },
+  "params_free": {
+    "_why": "Per-target or per-campaign; do not change which action is chosen.",
+    "names": [
+      "max_steps",
+      "device",
+      "ckpt_path",
+      "ckpt_every",
+      "verbose",
+      "resume_from",
+      "ckpt_every_step"
+    ]
+  },
+  "params_fixed_by_worker": {
+    "_why": "greedy_worker.py always passes these; recorded so a change is visible.",
+    "use_incremental_aux": true,
+    "use_exprkeyed": false,
+    "lazy_rs": true,
+    "model_batch_chunk": 8
+  },
+  "cli": {
+    "_why": "Checked by hierarchical_reduction.greedy_check_certified(). The env guard cannot see CLI values, so these are checked there or not at all. A wrong prime is SILENT: the p101 model was trained on a corpus generated entirely at 101, and at the repo-default 1009 the coefficient encoding is wrong with no error.",
+    "prime": 101,
+    "v7_cpus": 1,
+    "checkpoint_tail": "checkpoints/gravity3L_p101_scratch/best_model.pt"
+  },
+  "cli_free": {
+    "_why": "Per-target paths and per-campaign limits. --prime and --v7-cpus appear here as flags the worker ACCEPTS, while their VALUES are pinned under 'cli' and enforced by greedy_check_certified(); --verbose is the alias of -v.",
+    "names": [
+      "--topology",
+      "--integral",
+      "--output",
+      "--model-checkpoint",
+      "--max_steps",
+      "--device",
+      "-v",
+      "--paper-masters-only",
+      "--resume-from",
+      "--checkpoint-path",
+      "--checkpoint-interval",
+      "--checkpoint-time-seconds",
+      "--no-checkpoint",
+      "-h",
+      "--help",
+      "--prime",
+      "--v7-cpus",
+      "--verbose"
+    ]
+  },
+  "cli_must_not_be_used": {
+    "_why": "Accepted by the parser (parse_known_args tolerates anything) but NOT part of the certified configuration. Several name features that were stripped out of the module entirely, so passing them is silently inert rather than an error.",
+    "names": [
+      "--beam-sort",
+      "--dedup-beam-by-content",
+      "--random-target",
+      "--no-lazy-rs",
+      "--no-exprkeyed"
+    ]
+  },
+  "data_inputs": {
+    "_why": "CONTENT hashes of the files the certified run read. Paths alone are not enough: editing the pickle a pinned path points at changes the answers while every other guard passes. Directories hash as sorted (relpath, sha256) over their files, so an added or renamed file also changes it. Verify with scripts/greedy_data_hashes.py --check.",
+    "canon_pkl": {
+      "path": "results/canonical_sectors_GR_v2.pkl",
+      "sha256": "5d68bceb68276795d8870b436eaf76ca6fc38a08ec69a7a7cd78bcd14ac19033"
+    },
+    "checkpoint": {
+      "path": "checkpoints/gravity3L_p101_scratch/best_model.pt",
+      "sha256": "c8b1e3a1e49f35da536a63e4c501884bffe8c173e88a2c02f239a815c0cf0d40"
+    },
+    "store_pkl": {
+      "path": "results/gravity3L_transforms_v2.pkl",
+      "sha256": "ffaf5a53ce4fec322c5e7151ade7786e6b41b6a89c68f8ea61838bb7b216a57c"
+    },
+    "topology/integralfamilies.yaml": {
+      "path": "topology_input/gravity3L/integralfamilies.yaml",
+      "sha256": "4a6cd0dcc1fe9555d65338b87e22ce961436e5d44232d16ce0c507239e04f7d0"
+    },
+    "topology/kinematics.yaml": {
+      "path": "topology_input/gravity3L/kinematics.yaml",
+      "sha256": "cf885fad7d916df88483b6550ef4a3f7753e5c75b515a65466894770b1dce8d2"
+    }
+  }
+}
