@@ -120,10 +120,6 @@ def route_batch_condor(candidates, work_dir, tag, poll_s=10, timeout_s=21600):
                     f.write(",".join(str(x) for x in t) + "\n")
         batches.append((bf, of))
 
-    listf = os.path.join(rdir, f"rt_{tag}.list")
-    with open(listf, "w") as f:
-        for bf, of in batches:
-            f.write(f"{bf} {of}\n")
     subf = os.path.join(rdir, f"rt_{tag}.sub")
     # FILE-COUNT CONTROL. At BATCH=1 a per-process .out AND .err doubles the
     # inode cost of the whole pass for output we never read -- the batch summary
@@ -146,7 +142,7 @@ request_disk = 1GB
 log = {rdir}/logs/rt_{tag}.log
 output = {out_spec}
 error = {err_spec}
-queue bf,of from {listf}
+queue bf,of from {{listf}}
 """
     # DRIP SUBMIT. One condor_submit of every job jams the schedd at this scale
     # -- PITFALL 11 records 15,000 jobs leaving it unable to answer condor_q OR
