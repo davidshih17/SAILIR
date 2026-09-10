@@ -121,6 +121,18 @@ results/truth/combine_and_pack.sh
 # 5. TRAIN -- see TRAIN_FROM_SCRATCH.md
 ```
 
+### Diagnosing WHY a target fails: the truth-walk study
+
+When a target will not solve, this separates a POLICY problem from a SEARCH
+problem — walk its truth path and score the model at every step. On the one
+integral the p101 campaign never solved, the model ranked a correct action #1
+at 95.0% of 222 steps and inside the top-20 at every step, while ranking the
+reference action 50th on beam-wandered states: off-manifold generalization,
+not a bad policy. Full recipe, and the traps (the prime, tag injectivity,
+closure reuse):
+
+    docs/TRUTH_WALK_STUDY.md
+
 ### Running the trained model on an integral
 
 ```bash
