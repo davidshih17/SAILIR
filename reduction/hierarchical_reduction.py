@@ -96,50 +96,6 @@ def apply_substitutions(expr, cache, prime):
 _ITER_CLOCK = {'n': None, 't': None}
 
 
-# ---------------------------------------------------------------------------
-# PER-INTEGRAL TIME LIMIT for IN-PROCESS routing.
-#
-# routing_closure_worker.py enforces SAILIR_ROUTE_TIME_LIMIT on the Condor path,
-# but the orchestrator routes in-process whenever the Condor path is not taken --
-# i.e. below 1000 new candidates (fork pool >64, else a SERIAL loop). Those are
-# exactly the later iterations, once the frontier has shrunk, so without this the
-# limit silently stops applying at the point it matters most: one pathological
-# integral blocks the orchestrator itself, single-threaded, for hours.
-#
-# Measured over 104,383 integrals: median routes in 1.2s and p90 in 3.2min, while
-# a few hundred ran for HOURS (one still going at 6.7h). A timed-out integral
-# returns None = survivor, and is reduced by an IBP worker like any other
-# non-routable integral -- lossless, just less optimised.
-#
-# Must be module-level: multiprocessing pickles the callable by qualified name.
-_ROUTE_FN = None
-
-
-class _RouteTimeout(Exception):
-    pass
-
-
-def _route_timed(I):
-    """_ROUTE_FN(I), abandoned as a survivor past SAILIR_ROUTE_TIME_LIMIT."""
-    limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
-    if limit <= 0:
-        return _ROUTE_FN(I)
-    import signal
-
-    def _boom(signum, frame):
-        raise _RouteTimeout()
-
-    old = signal.signal(signal.SIGALRM, _boom)
-    signal.alarm(limit)
-    try:
-        return _ROUTE_FN(I)
-    except _RouteTimeout:
-        return None
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
-
-
 def _iter_tag(iteration):
     """[HH:MM:SS Iter N +Ns] and, on the FIRST print of a new iteration,
     "| Iter N-1 took Ds" -- the previous iteration's TRUE wall duration.
@@ -1049,6 +1005,14 @@ def main():
     if args.symmetry_staged:
         if not args.use_symmetry:
             raise SystemExit('--symmetry-staged requires --use-symmetry.')
+        # Routing is Condor-only, and routing_closure_worker hardcodes
+        # canonical_monolithic_rule, so a staged router cannot actually be used.
+        # Failing here is honest; the alternative is accepting the flag and
+        # routing monolithically anyway.
+        raise SystemExit(
+            '--symmetry-staged is not supported: routing now runs only in Condor '
+            'workers (routing_closure_worker), which use canonical_monolithic_rule. '
+            'The staged router would be silently ignored.')
         if os.environ.get('SAILIR_SECTOR_RANK', '0') != '1':
             raise SystemExit('--symmetry-staged requires SAILIR_SECTOR_RANK=1 (the '
                              'sector-senior order; step-1 descent needs it — ORDERING.md).')
@@ -1238,32 +1202,23 @@ def main():
         # Value-preserving: every rule is a GF(p) combination of exact symmetry
         # identities, so the final master combination is identical to the baseline.
         if args.use_symmetry:
-            from symmetry_route import (symmetry_rule, staged_rule,
-                                        canonical_monolithic_rule)
-            # Production default (2026-07-11): monolithic solve + hard
-            # canonical-sector guarantee. --symmetry-staged keeps the staged
-            # reference implementation; legacy order (no SAILIR_SECTOR_RANK)
-            # falls back to the plain monolithic router.
-            if args.symmetry_staged:
-                _route = staged_rule
-            elif os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
-                _route = canonical_monolithic_rule
-            else:
-                _route = symmetry_rule
-            global _ROUTE_FN
-            _ROUTE_FN = _route
+            # The orchestrator no longer imports a router: routing runs ONLY in
+            # Condor workers. Binding one here invited it to be called
+            # in-process, which is what the fork-pool and serial tiers did
+            # before they were removed.
+            #
+            # NOTE the worker HARDCODES canonical_monolithic_rule
+            # (routing_closure_worker.py: `from symmetry_route import
+            # canonical_monolithic_rule as _route`). That matches what this
+            # function used to select under SAILIR_SECTOR_RANK=1 without
+            # --symmetry-staged -- the certified configuration -- but NOT the
+            # other two branches, so --symmetry-staged is rejected below rather
+            # than silently ignored.
             _rt_limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
             routed_this_iter = 0
             while True:
                 cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
                 routed = 0
-                # PARALLEL ROUTING, restored from
-                # hierarchical_reduction.py.bak-pre-harness-refactor (2026-07-30).
-                # The harness refactor kept the routing logic but DROPPED both
-                # parallel tiers, leaving only the serial fallback. _route is a pure
-                # function of the integral so it parallelizes exactly; measured
-                # ~4s/route on high-L integrals, which over a ~680k frontier is WEEKS
-                # single-threaded -- the reason --use-symmetry was unusable in process.
                 # Numerator-degree gate: skip routing above this s. Checked
                 # BEFORE _route, so a skipped integral costs nothing. s is a
                 # PROXY chosen for predictability -- everything sampled at s<=5
@@ -1283,39 +1238,27 @@ def main():
                 if _skip_s:
                     print(f"[route] skipped {_skip_s} integral(s) with "
                           f"s>{_max_s} -> worker dispatch", flush=True)
-                if (os.environ.get('SAILIR_ROUTE_CONDOR', '0') == '1'
-                        and len(_new_c) >= 1000):
-                    # CONDOR routing: 100-integral closure batches; workers return
-                    # COMPOSED rules over survivors, so intermediates never enter
-                    # the fold/cache/GC.
+                # ROUTING ALWAYS GOES TO CONDOR. There is deliberately no
+                # in-process path: the orchestrator must dispatch, never compute.
+                #
+                # This used to fall back to a 16-core fork pool (>64 candidates)
+                # or a SERIAL loop (<=64), which meant the cheap-looking branches
+                # were taken exactly when the frontier had shrunk -- the later
+                # iterations -- and a single pathological integral then blocked
+                # the whole campaign inside the orchestrator process itself.
+                # Measured on the live pass: routing is bimodal to an extreme
+                # degree (median 1.2s, p90 3.2min, tail running 6.7h+), so ANY
+                # in-process routing is one bad integral away from a stall that
+                # also freezes submission, collection and bookkeeping.
+                #
+                # Condor per-integral jobs make the tail concurrent instead of
+                # blocking, and SAILIR_ROUTE_TIME_LIMIT bounds each one.
+                if _new_c:
                     from routing_condor import route_batch_condor
-                    print(f"[route] {len(_new_c)} candidates -> Condor batches", flush=True)
+                    print(f"[route] {len(_new_c)} candidates -> Condor "
+                          f"(limit {_rt_limit}s/integral)", flush=True)
                     sym_memo.update(route_batch_condor(
                         _new_c, str(work_dir), f"i{iteration}"))
-                elif len(_new_c) > 64:
-                    import multiprocessing as _mp
-                    _np = min(16, os.cpu_count() or 8)
-                    print(f"[route] routing {len(_new_c)} new candidates on {_np} cores"
-                          f" (time limit {_rt_limit}s/integral)", flush=True)
-                    with _mp.Pool(_np) as _pool:
-                        for _i, _rule in enumerate(
-                                _pool.imap(_route_timed, _new_c, chunksize=100)):
-                            sym_memo[_new_c[_i]] = _rule
-                            if (_i + 1) % 5000 == 0:
-                                print(f"[route]   ... {_i+1}/{len(_new_c)} routed",
-                                      flush=True)
-                else:
-                    import time as _tm
-                    _t0r = _tm.time()
-                    _n_to = 0
-                    for _ir, I_ in enumerate(_new_c):
-                        sym_memo[I_] = _route_timed(I_)
-                        if (_ir + 1) % 50 == 0:
-                            print(f"[route]   ... {_ir+1}/{len(_new_c)} routed serially, "
-                                  f"{_tm.time()-_t0r:.0f}s", flush=True)
-                    if _n_to:
-                        print(f"[route]   {_n_to} timed out past {_rt_limit}s "
-                              f"-> worker dispatch", flush=True)
                 # SIZE CAP, same rule as routing_closure_worker: a route that
                 # produces more terms than this is expression GROWTH, not
                 # reduction (measured: s=20 -> 1,315,600 terms against a
