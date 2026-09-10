@@ -980,8 +980,18 @@ def main():
         # at 101 (symmetry_engine_GR.py, SAILIR_SYM_PRIME/SAILIR_SYM_Y; the
         # 101 build gates ALL PASS with the same 204 sectors / 946 transforms).
         # canonicalize_GR asserts the same agreement on its side.
-        import canonicalize_GR as _CG
-        _sp = _CG._STORE.get('prod_point', (None,))[0]
+        # CHECK THE STORE ROUTING ACTUALLY USES. This guard used to import
+        # canonicalize_GR, but that is NOT the solver for gravity3L:
+        # symmetry_route binds topo_config.canonicalize_module(), which resolves
+        # to canonicalize2 with results/gravity3L_transforms_v2*.pkl.
+        # canonicalize_GR/gr_transforms.pkl is a separate lineage kept for the
+        # offline gate scripts. Validating it here checked a store no routing
+        # call ever loads, while its own import-time assert (P from
+        # SAILIR_SYM_PRIME, default 1009, vs the store's prod_point) aborted the
+        # run outright once SAILIR_SYM_STORE pointed at the p101 build.
+        import topo_config as _tc
+        _CG = _tc.canonicalize_module()
+        _sp = getattr(_CG, 'P', None)
         if _sp != args.prime:
             raise SystemExit(
                 f'--use-symmetry: transform store is at p={_sp} but --prime is '
@@ -989,8 +999,9 @@ def main():
                 f'mod p and must combine with IBP coefficients at the SAME '
                 f'prime.\nEither point SAILIR_SYM_STORE/SAILIR_SYM_PRIME at a '
                 f'store built for p={args.prime}, or run at p={_sp}.\n'
-                f'Store in use: {_CG._PKL}')
-        print(f'  [symmetry] store {_CG._PKL} at p={_sp} matches --prime', flush=True)
+                f'Store in use: {_tc.STORE_PKL}')
+        print(f'  [symmetry] store {_tc.STORE_PKL} at p={_sp} matches --prime '
+              f'(solver {_CG.__name__})', flush=True)
     if args.symmetry_staged:
         if not args.use_symmetry:
             raise SystemExit('--symmetry-staged requires --use-symmetry.')

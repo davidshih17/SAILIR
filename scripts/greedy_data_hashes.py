@@ -80,6 +80,17 @@ def targets(rec):
 
     sys.path.insert(0, os.path.join(REPO, 'reduction'))
     os.environ.setdefault('SAILIR_TOPOLOGY', topo or 'gravity3L')
+    # STRIP THE PATH OVERRIDES FIRST. topo_config.STORE_PKL and CANON_PKL are
+    # env-overridable (SAILIR_SYM_STORE / SAILIR_CANON_MAPS_PKL). The certified
+    # runner exports SAILIR_SYM_STORE=<p101 store>, so resolving through
+    # topo_config here hashed the p101 file and compared it against the 1009
+    # entry -- reporting the production store as CORRUPT when it was untouched.
+    # The p101 store has its own record entry (sym_store_p101) keyed by explicit
+    # path, so these two must resolve to the topology's OWN defaults.
+    _saved = {k: os.environ.pop(k)
+              for k in ('SAILIR_SYM_STORE', 'SAILIR_CANON_MAPS_PKL')
+              if k in os.environ}
+    sys.modules.pop('topo_config', None)     # force a re-read of the defaults
     try:
         import topo_config as tc
         for name in ('CANON_PKL', 'STORE_PKL'):
@@ -89,6 +100,9 @@ def targets(rec):
     except Exception as e:                       # noqa: BLE001
         print(f'  note: topo_config not importable ({e}); '
               f'hashing only checkpoint + topology', file=sys.stderr)
+    finally:
+        os.environ.update(_saved)
+        sys.modules.pop('topo_config', None)
     return out
 
 

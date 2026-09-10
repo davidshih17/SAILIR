@@ -109,7 +109,10 @@ fi
 
 if [ "$RESUME" = "1" ]; then
     [ -d "$OUTDIR/work/results" ] || { echo "REFUSING: no $OUTDIR/work/results to resume from" >&2; exit 1; }
-    echo "RESUMING from $(ls $OUTDIR/work/results/*.pkl 2>/dev/null | wc -l) completed worker results"
+    # COUNT WITHOUT A GLOB. `ls dir/*.pkl` expands to one argument per file and
+    # blows ARG_MAX at this scale -- with 303,393 results it failed outright and
+    # reported "RESUMING from 0", which reads exactly like a lost cache.
+    echo "RESUMING from $(find $OUTDIR/work/results -maxdepth 1 -name '"'"'*.pkl'"'"' -printf . 2>/dev/null | wc -c) completed worker results"
     RESUME_FLAG="--resume"
 elif [ -e "$OUTDIR" ]; then
     echo "REFUSING: $OUTDIR exists (version the tag, or set RESUME=1)" >&2

@@ -39,7 +39,7 @@
     "MALLOC_MMAP_THRESHOLD_": "67108864"
   },
   "env_model": {
-    "_why": "Tied to the checkpoint, not to the search.",
+    "_why": "Tied to the checkpoint, not to the search. SAILIR_SYM_STORE selects the transform store that topo_config.canonicalize_module() -- canonicalize2 for gravity3L -- loads, and canonicalize2 derives its prime from that store's prod_point, so the two cannot disagree. SAILIR_SYM_PRIME is deliberately NOT set: it is read only by canonicalize_GR, a separate lineage that no runtime routing call imports.",
     "SAILIR_TOPOLOGY": "gravity3L",
     "SAILIR_SYM_STORE": "results/gravity3L_transforms_v2_p101.pkl"
   },
