@@ -96,6 +96,50 @@ def apply_substitutions(expr, cache, prime):
 _ITER_CLOCK = {'n': None, 't': None}
 
 
+# ---------------------------------------------------------------------------
+# PER-INTEGRAL TIME LIMIT for IN-PROCESS routing.
+#
+# routing_closure_worker.py enforces SAILIR_ROUTE_TIME_LIMIT on the Condor path,
+# but the orchestrator routes in-process whenever the Condor path is not taken --
+# i.e. below 1000 new candidates (fork pool >64, else a SERIAL loop). Those are
+# exactly the later iterations, once the frontier has shrunk, so without this the
+# limit silently stops applying at the point it matters most: one pathological
+# integral blocks the orchestrator itself, single-threaded, for hours.
+#
+# Measured over 104,383 integrals: median routes in 1.2s and p90 in 3.2min, while
+# a few hundred ran for HOURS (one still going at 6.7h). A timed-out integral
+# returns None = survivor, and is reduced by an IBP worker like any other
+# non-routable integral -- lossless, just less optimised.
+#
+# Must be module-level: multiprocessing pickles the callable by qualified name.
+_ROUTE_FN = None
+
+
+class _RouteTimeout(Exception):
+    pass
+
+
+def _route_timed(I):
+    """_ROUTE_FN(I), abandoned as a survivor past SAILIR_ROUTE_TIME_LIMIT."""
+    limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
+    if limit <= 0:
+        return _ROUTE_FN(I)
+    import signal
+
+    def _boom(signum, frame):
+        raise _RouteTimeout()
+
+    old = signal.signal(signal.SIGALRM, _boom)
+    signal.alarm(limit)
+    try:
+        return _ROUTE_FN(I)
+    except _RouteTimeout:
+        return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def _iter_tag(iteration):
     """[HH:MM:SS Iter N +Ns] and, on the FIRST print of a new iteration,
     "| Iter N-1 took Ds" -- the previous iteration's TRUE wall duration.
@@ -1206,6 +1250,9 @@ def main():
                 _route = canonical_monolithic_rule
             else:
                 _route = symmetry_rule
+            global _ROUTE_FN
+            _ROUTE_FN = _route
+            _rt_limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
             routed_this_iter = 0
             while True:
                 cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
@@ -1248,11 +1295,11 @@ def main():
                 elif len(_new_c) > 64:
                     import multiprocessing as _mp
                     _np = min(16, os.cpu_count() or 8)
-                    print(f"[route] routing {len(_new_c)} new candidates on {_np} cores",
-                          flush=True)
+                    print(f"[route] routing {len(_new_c)} new candidates on {_np} cores"
+                          f" (time limit {_rt_limit}s/integral)", flush=True)
                     with _mp.Pool(_np) as _pool:
                         for _i, _rule in enumerate(
-                                _pool.imap(_route, _new_c, chunksize=100)):
+                                _pool.imap(_route_timed, _new_c, chunksize=100)):
                             sym_memo[_new_c[_i]] = _rule
                             if (_i + 1) % 5000 == 0:
                                 print(f"[route]   ... {_i+1}/{len(_new_c)} routed",
@@ -1260,11 +1307,15 @@ def main():
                 else:
                     import time as _tm
                     _t0r = _tm.time()
+                    _n_to = 0
                     for _ir, I_ in enumerate(_new_c):
-                        sym_memo[I_] = _route(I_)
+                        sym_memo[I_] = _route_timed(I_)
                         if (_ir + 1) % 50 == 0:
                             print(f"[route]   ... {_ir+1}/{len(_new_c)} routed serially, "
                                   f"{_tm.time()-_t0r:.0f}s", flush=True)
+                    if _n_to:
+                        print(f"[route]   {_n_to} timed out past {_rt_limit}s "
+                              f"-> worker dispatch", flush=True)
                 # SIZE CAP, same rule as routing_closure_worker: a route that
                 # produces more terms than this is expression GROWTH, not
                 # reduction (measured: s=20 -> 1,315,600 terms against a

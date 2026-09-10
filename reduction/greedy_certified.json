@@ -35,7 +35,8 @@
     "SAILIR_ROUTE_MAX_EXPAND": "20000",
     "SAILIR_ROUTE_BATCH": "1",
     "SAILIR_ROUTE_SUBMIT_CHUNK": "5000",
-    "SAILIR_ROUTE_QUEUE_CEILING": "8000"
+    "SAILIR_ROUTE_QUEUE_CEILING": "8000",
+    "SAILIR_ROUTE_TIME_LIMIT": "300"
   },
   "env_set_perf": {
     "_why": "Speed only, results identical. Not guarded as semantics, but a wrong value is a ~20x cliff, so it is still recorded and pinned.",

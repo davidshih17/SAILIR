@@ -30,6 +30,9 @@ PYTHON = "/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
 # unable to answer condor_q OR condor_rm). Hence SUBMIT_CHUNK drip feeding.
 BATCH = int(os.environ.get('SAILIR_ROUTE_BATCH', '100'))
 SUBMIT_CHUNK = int(os.environ.get('SAILIR_ROUTE_SUBMIT_CHUNK', '5000'))
+# Opt-in only: recompute missing batches in-process instead of marking them
+# not-routed. OFF by default -- see the note at the fallback for why.
+SERIAL_FALLBACK = os.environ.get('SAILIR_ROUTE_SERIAL_FALLBACK') == '1'
 QUEUE_CEILING = int(os.environ.get('SAILIR_ROUTE_QUEUE_CEILING', '8000'))
 
 
@@ -120,6 +123,7 @@ def route_batch_condor(candidates, work_dir, tag, poll_s=10, timeout_s=21600):
                     f.write(",".join(str(x) for x in t) + "\n")
         batches.append((bf, of))
 
+    job_limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300')) * 3 + 300
     subf = os.path.join(rdir, f"rt_{tag}.sub")
     # FILE-COUNT CONTROL. At BATCH=1 a per-process .out AND .err doubles the
     # inode cost of the whole pass for output we never read -- the batch summary
@@ -139,6 +143,10 @@ arguments = "$(bf) $(of)"
 request_cpus = 1
 request_memory = 2GB
 request_disk = 1GB
+# BACKSTOP for a job that hangs instead of returning. The worker's own SIGALRM
+# handles the normal case gracefully (writes None); this catches the rest.
+# Given a slack multiple over the worker limit so it never fires first.
+periodic_remove = (JobStatus == 2) && ((time() - JobCurrentStartDate) > {job_limit})
 log = {rdir}/logs/rt_{tag}.log
 output = {out_spec}
 error = {err_spec}
@@ -231,12 +239,40 @@ queue bf,of from {{listf}}
             except Exception:
                 pass
         serial_fallback.append(bf)
+    if serial_fallback and not SERIAL_FALLBACK:
+        # NEVER RECOMPUTE STRAGGLERS SERIALLY BY DEFAULT. "Not routed" is already
+        # a valid, lossless answer: None means survivor, and the orchestrator
+        # dispatches an IBP worker -- the same handling every non-routable
+        # integral gets. Recomputing instead blocks the ENTIRE campaign on the
+        # single slowest class of work that exists, because by construction the
+        # leftovers ARE the pathological tail.
+        #
+        # Measured on the live g1023 pass: 218 leftovers, each in the 30min-6.7h
+        # class, i.e. ~100 hours of blocking serial work on the login node -- and
+        # 120 Condor jobs were still computing those very integrals in parallel
+        # at the same time. The old warning estimated "~27s each" from the MEDIAN
+        # integral, understating it by orders of magnitude.
+        #
+        # This is also what makes SAILIR_ROUTE_TIME_LIMIT safe: without it, every
+        # integral the time limit kills would come straight back here to be
+        # recomputed serially, with no limit at all.
+        print(f"[route-condor] {len(serial_fallback)} batch(es) had no output "
+              f"after {time.time()-t0:.0f}s -> marking NOT ROUTED (survivor, "
+              f"IBP worker dispatch). Lossless: routing is an optimisation, "
+              f"not a requirement.", flush=True)
+        for bf in serial_fallback:
+            if not os.path.exists(bf):
+                out[tuple(int(x) for x in bf.split("_" if "_" in bf else ","))] = None
+            else:
+                for ln in open(bf):
+                    ln = ln.strip()
+                    if ln:
+                        out[tuple(int(x) for x in ln.split(","))] = None
+        serial_fallback = []
     if serial_fallback:
-        print(f"[route-condor] WARNING: {len(serial_fallback)} batch(es) had no "
-              f"output after {time.time()-t0:.0f}s — recomputing "
-              f"~{len(serial_fallback)*BATCH} integrals SERIALLY in-process. "
-              f"At ~27s each this is ~{len(serial_fallback)*BATCH*27/3600:.1f}h "
-              f"and the orchestrator is BLOCKED throughout.", flush=True)
+        print(f"[route-condor] WARNING: recomputing {len(serial_fallback)} "
+              f"batch(es) SERIALLY (SAILIR_ROUTE_SERIAL_FALLBACK=1); the "
+              f"orchestrator is BLOCKED throughout.", flush=True)
         import sys
         sys.path.insert(0, os.path.join(ROOT, "reduction"))
         from symmetry_route import canonical_monolithic_rule as _route

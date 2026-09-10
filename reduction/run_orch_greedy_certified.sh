@@ -89,6 +89,12 @@ export SAILIR_ROUTE_MAX_EXPAND=20000
 # incremental and the tail isolated. Startup does not argue against it: the
 # worker needs only symmetry_route and a 200 KB store, measured at 0.02s.
 export SAILIR_ROUTE_BATCH=1
+# PER-INTEGRAL TIME LIMIT on symmetry routing. Measured over 104,383 integrals:
+# median routes in 1.2s, p90 in 3.2min, but a few hundred ran for HOURS (one was
+# still going at 6.7h), turning a pass that should be free into ~5,700 CPU-hours
+# and defeating the purpose of routing. A timed-out integral becomes a survivor
+# and is reduced by an IBP worker instead -- lossless, just less optimised.
+export SAILIR_ROUTE_TIME_LIMIT=300
 # Drip-feed: 104k jobs in one condor_submit jams the schedd (PITFALL 11).
 export SAILIR_ROUTE_SUBMIT_CHUNK=5000
 export SAILIR_ROUTE_QUEUE_CEILING=8000

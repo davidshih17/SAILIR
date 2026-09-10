@@ -100,14 +100,52 @@ n_capped = 0
 n_skipped_s = 0
 
 
+# PER-INTEGRAL TIME LIMIT. Routing cost is bimodal to an extreme degree:
+# measured over 104,383 integrals, the MEDIAN routes in 1.2s and p90 in 3.2min,
+# while a few hundred ran for HOURS -- one straggler was still going at 6.7h.
+# That tail made a pass that should be free cost ~5,700 CPU-hours, defeating the
+# point of routing, which exists to AVOID dispatching an IBP worker.
+#
+# A timeout is nondeterministic in principle (the same integral may route on a
+# fast node and not on a loaded one), and that is a real cost. It is accepted
+# here because the alternative measured worse: the answer is never WRONG, only
+# less optimised -- a timed-out integral becomes None, i.e. a survivor, and gets
+# reduced by IBP exactly as any non-routable integral does. Routing is an
+# optimisation, not a requirement.
+_TIME_LIMIT = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
+n_timeout = 0
+
+
+class _RouteTimeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _RouteTimeout()
+
+
+if _TIME_LIMIT > 0:
+    import signal
+    signal.signal(signal.SIGALRM, _on_alarm)
+
+
 def route(i):
-    global n_capped, n_skipped_s
+    global n_capped, n_skipped_s, n_timeout
     if i not in raw:
         if _MAX_S >= 0 and -sum(x for x in i if x < 0) > _MAX_S:
             n_skipped_s += 1
             raw[i] = None
             return None
-        r = _route(i)
+        if _TIME_LIMIT > 0:
+            signal.alarm(_TIME_LIMIT)
+        try:
+            r = _route(i)
+        except _RouteTimeout:
+            n_timeout += 1
+            r = None
+        finally:
+            if _TIME_LIMIT > 0:
+                signal.alarm(0)
         if r is not None and len(r) > _MAX_TERMS:
             n_capped += 1
             r = None
@@ -169,7 +207,8 @@ with open(outfile + ".tmp", "wb") as f:
     pickle.dump(res, f)
 os.replace(outfile + ".tmp", outfile)
 sizes = sorted(len(v) for v in res.values() if v is not None)
-print(f"  skipped {n_skipped_s} integral(s) with s>{_MAX_S}; "
+print(f"  timed out {n_timeout} integral(s) after {_TIME_LIMIT}s; "
+      f"skipped {n_skipped_s} integral(s) with s>{_MAX_S}; "
       f"capped {n_capped} route(s) over {_MAX_TERMS} terms "
       f"(both -> worker dispatch)", flush=True)
 print(f"batch {os.path.basename(infile)}: {len(integrals)} integrals, "
