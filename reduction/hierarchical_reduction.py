@@ -227,10 +227,21 @@ def get_non_masters(expr):
     return {i for i, c in expr.items() if c != 0 and not is_master(i)}
 
 
-def full_weight(integral):
-    """Return (level, r, s) for lex-ordering. level (number of denominators in
-    the sector mask) dominates because reductions are hierarchical: an L8
-    integral with low (r,s) gates an L7 integral with high (r,s)."""
+def coarse_weight(integral):
+    """(level, r, s) — a COARSE bucketing for REPORTING ONLY. Larger = higher.
+
+    THIS IS NOT THE REDUCTION ORDER. The order rules descend in is
+    total_order.tkey (smaller = higher, sector-RANK senior, |abs| tiebreak).
+    The two look interchangeable -- both are weight-ish tuples led by a coarse
+    structural term -- and that cost a campaign restart: apply_substitutions
+    ordered its worklist heap by this function, but a rule can move to a higher
+    (level, r, s) while still descending in tkey, because this knows sector
+    SIZE and tkey knows sector RANK. The topological guarantee silently failed
+    and the fold truncated.
+
+    Renamed from full_weight so the name itself stops implying it is the
+    authoritative weight. Use tkey for anything that orders reductions.
+    """
     level = sum(get_sector_mask(integral))
     r, s = weight(integral)[:2]
     return (level, r, s)
@@ -1343,9 +1354,15 @@ def main():
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
         if available_slots < len(to_submit):
-            # Prioritize by full hierarchical weight (level, r, s); level
-            # dominates so upstream sectors clear before downstream ones.
-            to_submit = sorted(to_submit, key=lambda i: tuple(-x for x in full_weight(i)))
+            # Prioritise by the REDUCTION ORDER itself: smaller tkey = higher
+            # = eliminated first, so the most upstream integrals clear first.
+            # This used to sort by coarse_weight (level, r, s), but tkey's
+            # senior component already encodes that -- sector_rank orders masks
+            # by `(bin(S).count("1"), rep_of[S], ...)`, i.e. propagator count
+            # first -- and then refines it with orbit grouping and the |abs|
+            # tiebreak. Dispatching in the order the reduction actually descends
+            # in beats a coarser restatement of it.
+            to_submit = sorted(to_submit, key=_tkey)
             to_submit = set(to_submit[:available_slots])
 
         # Submit new jobs: build the WHOLE iteration's batch, then ONE
@@ -1725,12 +1742,12 @@ def main():
         masters_count = sum(1 for i, c in expr.items() if c != 0 and is_master(i))
         non_masters_count = len(non_masters)
 
-        # Frontier: max full_weight tuple still pending, and count at that tuple.
+        # Frontier: max coarse_weight tuple still pending, and count at that tuple.
         if non_masters:
             # ONE PASS, NOT FOUR. This block is pure logging, and it used to
-            # sweep non_masters four separate times -- max(full_weight), a
+            # sweep non_masters four separate times -- max(coarse_weight), a
             # second scan counting equals, work_units, then the bucket loop --
-            # i.e. ~4 full_weight calls per integral. Over a 1.2M-term
+            # i.e. ~4 coarse_weight calls per integral. Over a 1.2M-term
             # expression that is ~5 MILLION weight() calls per iteration, and
             # py-spy put 37% of orchestrator samples inside weight() with
             # another 45% in apply_substitutions. Everything below is derivable
@@ -1746,7 +1763,7 @@ def main():
             fw_counts = {}
             work = 0
             for i in non_masters:
-                fw = full_weight(i)
+                fw = coarse_weight(i)
                 L, r, s_ = fw
                 work += L * 1_000_000 + r * 1000 + s_
                 fw_counts[fw] = fw_counts.get(fw, 0) + 1
