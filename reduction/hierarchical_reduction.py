@@ -1168,7 +1168,7 @@ def main():
               f'in {time.time()-t_resume:.1f}s', flush=True)
         # Apply all cached substitutions to start_expr to recover current state.
         t_apply = time.time()
-        expr = apply_substitutions(expr, cache, args.prime)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
         print(f'[RESUME] Applied substitutions to expr in {time.time()-t_apply:.1f}s; '
               f'|expr|={len(expr)}, |cache|={len(cache)}', flush=True)
 
@@ -1208,7 +1208,7 @@ def main():
                     cache[integ] = {integ: 1}
             print(f'[RESUME-FROM] Loaded {len(cache)} cache entries in '
                   f'{time.time()-t_rf:.1f}s', flush=True)
-        expr = apply_substitutions(expr, cache, args.prime)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
 
     # --reduce-only: restrict this round to a target list by DROPPING those
     # integrals from the (resumed) cache so they re-submit. Seed expr from the
@@ -1267,7 +1267,7 @@ def main():
 
         # Apply all cached substitutions to the expression
         old_size = len(expr)
-        expr = apply_substitutions(expr, cache, args.prime)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
 
         # DESIGN 1 symmetry routing: reduce every symmetry-reducible non-master for
         # FREE (strictly-lowering rewrite -> cache, no worker) and cascade the
@@ -1777,7 +1777,7 @@ def main():
                   f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
 
     # Final substitution
-    expr = apply_substitutions(expr, cache, args.prime)
+    expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
 
     # Final report
     elapsed = time.time() - start_time
