@@ -46,6 +46,15 @@ export SAILIR_WORKER_GREEDY=1
 eval "$($PYTHON $B/scripts/greedy_env.py --export | grep SAILIR_TOPOLOGY)"
 # Orchestrator-side only: routing and the delta substitution store. These
 # govern how the orchestrator dispatches, not how a worker searches.
+# SYMMETRY STORE at the model's prime. canonicalize_GR (hence symmetry_route,
+# hence the orchestrator's Design-1 routing) reads these; without them it loads
+# the 1009 store and the store-vs---prime guard refuses to start. The canonical
+# SECTOR table needs no rebuild: rebuilding it from the 101 store reproduced
+# results/canonical_sectors_GR_v2.pkl byte-identically, because sector
+# canonicalization depends on WHICH maps exist, not on the field.
+export SAILIR_SYM_PRIME=101
+export SAILIR_SYM_STORE=results/gr_transforms_p101.pkl
+
 export SAILIR_ROUTE_CONDOR=1
 export SAILIR_DELTA_SUBS=1
 export PYTHONUNBUFFERED=1
@@ -62,28 +71,106 @@ if ! $PYTHON $B/scripts/greedy_data_hashes.py --check; then
 fi
 
 OUTDIR=$B/results/gr_reduce/$TAG
+RESUME=${RESUME:-0}
+
+# LOG NAMING: never reuse a name. Each launch writes orch.log, orch_resume1.log,
+# orch_resume2.log ... A resume that redirected to the existing orch.log would
+# TRUNCATE it on open ('>'), destroying the record of the run being resumed --
+# including the iteration history and every divergence decision.
 LOG=$OUTDIR/logs/orch.log
-if [ -e "$OUTDIR" ]; then
-    echo "REFUSING: $OUTDIR exists (version the tag)" >&2
+if [ "$RESUME" = "1" ]; then
+    n=1
+    while [ -e "$OUTDIR/logs/orch_resume$n.log" ]; do n=$((n+1)); done
+    LOG=$OUTDIR/logs/orch_resume$n.log
+fi
+
+if [ "$RESUME" = "1" ]; then
+    [ -d "$OUTDIR/work/results" ] || { echo "REFUSING: no $OUTDIR/work/results to resume from" >&2; exit 1; }
+    echo "RESUMING from $(ls $OUTDIR/work/results/*.pkl 2>/dev/null | wc -l) completed worker results"
+    RESUME_FLAG="--resume"
+elif [ -e "$OUTDIR" ]; then
+    echo "REFUSING: $OUTDIR exists (version the tag, or set RESUME=1)" >&2
     exit 1
+else
+    RESUME_FLAG=""
 fi
 mkdir -p $OUTDIR/logs $OUTDIR/work
+
+# DIVERGENCE SWEEP. The memory cap cannot run on its own: the whole sweep sits
+# behind `if args.diverge_nm > 0`, so --diverge-mem-mb alone is inert. Setting
+# an unreachable nm threshold enables the block while leaving memory the only
+# reason that ever fires (the kill triggers on EITHER reason, independently).
+#
+# This must be the orchestrator's OWN sweep, not an external watchdog: it does
+# `del pending[integral]`, returning the slot. An outside condor_rm leaves the
+# entry in `pending` forever and `available_slots = max_concurrent - len(pending)`
+# decays to zero -- measured previously at 625 of 1000 slots dead after 7h.
+# QUEUE DEPTH. --max-concurrent caps SUBMITTED jobs (running + idle), NOT
+# running ones: hierarchical_reduction has no JobStatus==2 check anywhere, so
+# how many actually run is Condor's fair share. At 1000 the queue drained
+# faster than the orchestrator refilled it -- measured 430-614 running with
+# idle=0 through most of a 56s median iteration (p90 131s, max 152s), i.e.
+# slots sat empty waiting for the next submit while workers finish in ~6s.
+# A deeper queue keeps idle jobs ready so Condor fills a freed slot at once.
+# Stay well under the ~40k that once jammed the schedd; for larger batches see
+# results/truth/p101_cull_corpus_v2/drip_submit.sh.
+# --no-paper-masters-only, EXPLICITLY. The flag is BooleanOptionalAction with
+# default=True, so merely OMITTING it leaves paper-masters-only ON -- a silent
+# no-op. Measured: after removing the flag the frontier still reported L9r9:6
+# rather than dropping the two corners to 4. The negation must be passed.
+#
+# The terminal set is paper masters UNION corner
+# integrals in sectors the basis does not cover, which is what
+# ibp_env.is_master already computes when PAPER_MASTERS_ONLY is False. The flag
+# short-circuits that and makes corners non-terminal -- but IBP cannot reduce a
+# corner within its own sector, and symmetry-first is off, so such a worker has
+# no legal move and grinds until the memory guard kills it.
+# 3000 was still not enough: idle fell back to 0 with running draining, because
+# iterations grew to 142-208s as the frontier passed 680k, so the queue has to
+# cover a ~3-minute gap between submits, not the ~50s it did at 600k.
+# --use-symmetry (DESIGN 1 routing). OFF by default (action='store_true') and
+# NOT used by any of the first four runs -- zero 'symmetry-routed' lines in
+# orch.log, orch_resume1/2/3.log. That is the root cause of the stalled
+# frontier, not the queue depth:
+#   * the corpus sampled targets ONLY from the 298 canonical sectors (12,584 of
+#     12,584), and every truth trajectory is pure IBP -- the truth engine never
+#     calls canonical_monolithic_rule, it imports symmetry_route only for tkey.
+#   * but IBP daughters land in SUBSECTORS, and a subsector of a canonical
+#     sector need not be canonical. Measured: 213 of 307 sampled reductions from
+#     a canonical parent (69%) emit at least one non-canonical daughter.
+#   * a non-canonical integral's route down is a symmetry relabelling, which
+#     IBP cannot perform -- the identity to the master ASCENDS the order. With
+#     routing off the worker has no legal move and grinds to the memory guard.
+#     Five of the six L9r9 frontier integrals map to a master in ONE term.
+# Routing is free (cache entry, no worker), cascades to survivors, and is
+# value-preserving, so it only ADDS cache entries -- the 281,815 already
+# computed stay valid.
+MAX_CONCURRENT=${MAX_CONCURRENT:-10000}
+
+DIVERGE_MEM_MB=${DIVERGE_MEM_MB:-15000}
+DIVERGE_FLAGS="--diverge-nm 100000000 --diverge-mem-mb $DIVERGE_MEM_MB"
 
 echo "target     : $TARGET"
 echo "prime      : $GREEDY_PRIME   (certified; the repo default 1009 is WRONG here)"
 echo "v7-cpus    : $GREEDY_V7_CPUS"
 echo "checkpoint : $GREEDY_CKPT"
 echo "log        : $LOG"
+echo "resume     : $RESUME   diverge: mem>${DIVERGE_MEM_MB}MB only"
+echo "queue cap  : $MAX_CONCURRENT submitted (running = Condor fair-share, not capped here)"
 
 setsid $PYTHON -u $B/reduction/hierarchical_reduction.py \
     --topology $B/topology_input/gravity3L --integral="$TARGET" \
     --output $OUTDIR/reduction.pkl --work-dir $OUTDIR/work \
     --model-checkpoint $B/$GREEDY_CKPT \
     --beam_width 1 --max_steps 1000000 --prime $GREEDY_PRIME \
-    --paper-masters-only --use-v7-worker --v7-cpus $GREEDY_V7_CPUS \
+    --no-paper-masters-only \
+    --use-symmetry \
+    --use-v7-worker --v7-cpus $GREEDY_V7_CPUS \
     --worker-memory-gb 4 \
     --straggler-timeout 1000000000 --straggler2-timeout 1000000000 \
-    --max-concurrent 1000 --check-interval 5 \
+    --max-concurrent $MAX_CONCURRENT --check-interval 5 \
+    $RESUME_FLAG \
+    $DIVERGE_FLAGS \
     > $LOG 2>&1 < /dev/null &
 
 echo "launched pid $! -- NOT yet verified alive"

@@ -73,6 +73,11 @@ def targets(rec):
         for f in ('integralfamilies.yaml', 'kinematics.yaml'):
             if os.path.exists(os.path.join(d, f)):
                 out[f'topology/{f}'] = os.path.join(d, f)
+    # the symmetry transform store, when the record pins one (p101 routing)
+    sym = rec.get('env_model', {}).get('SAILIR_SYM_STORE')
+    if sym:
+        out['sym_store_p101'] = os.path.join(REPO, sym)
+
     sys.path.insert(0, os.path.join(REPO, 'reduction'))
     os.environ.setdefault('SAILIR_TOPOLOGY', topo or 'gravity3L')
     try:

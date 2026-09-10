@@ -38,7 +38,9 @@
   },
   "env_model": {
     "_why": "Tied to the checkpoint, not to the search.",
-    "SAILIR_TOPOLOGY": "gravity3L"
+    "SAILIR_TOPOLOGY": "gravity3L",
+    "SAILIR_SYM_PRIME": "101",
+    "SAILIR_SYM_STORE": "results/gr_transforms_p101.pkl"
   },
   "env_must_be_unset": {
     "_why": [
@@ -137,7 +139,6 @@
       "--max_steps",
       "--device",
       "-v",
-      "--paper-masters-only",
       "--resume-from",
       "--checkpoint-path",
       "--checkpoint-interval",
@@ -151,7 +152,7 @@
     ]
   },
   "cli_must_not_be_used": {
-    "_why": "Accepted by the parser (parse_known_args tolerates anything) but NOT part of the certified configuration. Several name features that were stripped out of the module entirely, so passing them is silently inert rather than an error.",
+    "_why": "Accepted by the parser (parse_known_args tolerates anything) but NOT part of the certified configuration. Several name features that were stripped out of the module entirely, so passing them is silently inert rather than an error. --paper-masters-only is now BANNED, not merely inert. ibp_env.is_master already implements the terminal set we want -- paper masters UNION corner integrals in sectors the basis does not cover -- and this flag short-circuits it (`if PAPER_MASTERS_ONLY: return False`), making those corners NON-terminal. A corner cannot be reduced by IBP within its own sector (nothing is simpler there) and SAILIR_SYM_FIRST is unset, so a worker handed one has no legal way down: it grinds until the memory guard kills it. Measured: (1,0,1,1,1,1,1,1,1,1,...) -- r=9 s=0, the least exotic integral in the g1023 frontier -- was killed at 15 GB, and the closure builder failed on it with 'pivot absent after substitution'. Three of the six L9r9 frontier integrals were lost this way, and the reduction cannot complete without them. Terminating at corners is correct and strictly EARLIER, so nothing already-solved changes.",
     "names": [
       "--beam-sort",
       "--dedup-beam-by-content",
@@ -181,6 +182,18 @@
     "topology/kinematics.yaml": {
       "path": "topology_input/gravity3L/kinematics.yaml",
       "sha256": "cf885fad7d916df88483b6550ef4a3f7753e5c75b515a65466894770b1dce8d2"
+    },
+    "sym_store_p101": {
+      "path": "results/gr_transforms_p101.pkl",
+      "sha256": "86c30bce1ae5189052bcb87dd232dde0270720982b371f18eaf796a2fd4e6255"
     }
+  },
+  "cli_required": {
+    "_why": "Flags that must be passed EXPLICITLY. --no-paper-masters-only is required because --paper-masters-only is BooleanOptionalAction with default=True on BOTH the orchestrator and the worker: omitting it leaves paper-masters-only ON. Verified by the frontier still showing L9r9:6 after the flag was removed, instead of 4 with the two corners counted as masters. The terminal set must be paper masters UNION corners -- IBP cannot reduce a corner within its own sector, so a worker handed one has no legal move and grinds until the memory guard kills it. --use-symmetry is REQUIRED: the corpus sampled targets only from the 298 canonical sectors and every truth trajectory is pure IBP, but 69% of reductions from a canonical parent emit NON-canonical daughters (213/307 measured). A non-canonical integral descends only by a symmetry relabelling, which IBP cannot perform -- the identity to the master ascends the order -- so without routing the worker has no legal move and grinds to the memory guard. Routing is free (cache entry, no worker), cascades to survivors, and is value-preserving.",
+    "names": [
+      "--no-paper-masters-only",
+      "--paper-masters-only",
+      "--use-symmetry"
+    ]
   }
 }

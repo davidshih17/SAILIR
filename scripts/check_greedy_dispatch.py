@@ -109,6 +109,11 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         rp = os.path.join(td, 'ref_orch.py')
         open(rp, 'w').write(ref_src)
+        # hierarchical_reduction loads greedy_certified.json from ITS OWN
+        # directory, so a copy exec'd out of /tmp needs the record beside it
+        import shutil
+        shutil.copy(os.path.join(REPO, 'reduction', 'greedy_certified.json'),
+                    os.path.join(td, 'greedy_certified.json'))
         ref_mod = load(rp, 'orch_ref')
         base_env = {'SAILIR_WORKER_V9': '1', 'SAILIR_SCORE': 'local',
                     'SAILIR_NM_PENALTY': '0', 'SAILIR_BEAM_TOTAL': '1',

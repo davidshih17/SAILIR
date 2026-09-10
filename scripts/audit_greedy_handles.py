@@ -149,7 +149,10 @@ def main():
     pinned_arg = keys('params') | keys('params_fixed_by_worker')
     free_arg = names('params_free')
     pinned_cli = keys('cli')
-    free_cli = names('cli_free') | names('cli_must_not_be_used')
+    # cli_required: flags that must be passed EXPLICITLY because their
+    # argparse default is the WRONG value (BooleanOptionalAction default=True)
+    free_cli = (names('cli_free') | names('cli_must_not_be_used')
+                | names('cli_required'))
 
     rc, unknown = 0, []
 

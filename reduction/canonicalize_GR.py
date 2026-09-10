@@ -32,11 +32,18 @@ ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "reduction"))
 from sailir.symmetries import sector_of
 
-P = 1009
+# Prime and store are overridable TOGETHER (the assert below enforces that they
+# agree). The p101 model needs symmetry transforms at 101: a transform's
+# coefficients are rationals reduced mod p and must combine with IBP
+# coefficients at the SAME prime, which is why hierarchical_reduction refuses
+# --use-symmetry when --prime disagrees with the store's prod_point.
+# Defaults unchanged -> an unset environment is the validated 1009 behaviour.
+P = int(os.environ.get('SAILIR_SYM_PRIME', 1009))
 N = 15
 N_DEN = 10
 
-_PKL = os.path.join(ROOT, "results/gr_transforms.pkl")
+_PKL = os.path.join(ROOT, os.environ.get("SAILIR_SYM_STORE",
+                                          "results/gr_transforms.pkl"))
 with open(_PKL, "rb") as f:
     _STORE = pickle.load(f)
 assert _STORE.get("prod_point", (P,))[0] == P, "gr_transforms.pkl prime mismatch"

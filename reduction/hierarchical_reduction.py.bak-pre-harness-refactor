@@ -25,7 +25,6 @@ import argparse
 import pickle
 import time
 import subprocess
-import json
 import os
 import resource
 from pathlib import Path
@@ -35,11 +34,6 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))   # repo root (SAILIR_phase2) for `sailir`
 sys.path.insert(0, str(_HERE.parent))          # this dir (reduction/) for siblings
 
-import re as _re
-# Worker step line: pull max weight, non-master count, store size, time.
-_DIVERGE_LINE = _re.compile(
-    r'\[v6 step +(\d+)\].*?best mw=\((\d+), (\d+),.*?'
-    r'nm=(\d+).*?rs_vsz=(\d+).*?t_total=([0-9.]+)')
 from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
 
@@ -86,38 +80,81 @@ def apply_substitutions(expr, cache, prime):
     return expr
 
 
-# ── ITERATION CLOCK ─────────────────────────────────────────────────────────
-# Every "[Iter N]" line carries a wall-clock stamp and the seconds elapsed
-# since that iteration's FIRST print. Without this, iteration duration is
-# unrecoverable from the log after the fact: the lines are ordered but
-# untimed, so a 25s iteration and a 10min iteration look identical, and the
-# only way to tell was to sample a LIVE process against the wall clock.
-# Iteration duration = delta between consecutive iterations' first stamps.
-_ITER_CLOCK = {'n': None, 't': None}
+def apply_substitutions_delta(expr, cache, new_keys, prime, max_pops=10_000_000):
+    """Incremental substitution (2026-07-27): equivalent to
+    apply_substitutions(expr, cache, prime) UNDER THE LOOP INVARIANT that expr
+    already contains no key of the cache except (possibly) the just-added
+    `new_keys`. Worklist seeded by the new keys; every introduced term is
+    looked up against the FULL cache, so new-entry RHS terms that hit old
+    entries chain correctly (the only cross-interaction that exists — old
+    entries can never newly apply to the old part of expr, which is
+    cached-key-free by the invariant). Confluent because every entry rewrites
+    its key into strictly-lower integrals (the one-step contract), so the
+    normal form is order-independent.
 
+    Cost: proportional to the substitution work of the NEW results only, not
+    to |expr| x |cache| per pass like the full fixpoint.
 
-def _iter_tag(iteration):
-    """[HH:MM:SS Iter N +Ns] and, on the FIRST print of a new iteration,
-    "| Iter N-1 took Ds" -- the previous iteration's TRUE wall duration.
-
-    +Ns alone is misleading and was: it counts from the iteration's first
-    print, but an iteration keeps working after its LAST print (reaping, the
-    check-interval wait). Measured: Iter 175 logged "+59.6s" on its final line
-    at 19:10:51, while Iter 176 did not begin until 19:12:54 -- a real span of
-    183s, of which 123s was invisible. Only the delta between consecutive
-    first-prints is the duration, so it is computed and written here rather
-    than left for a reader to reconstruct from timestamps.
+    Edge cases handled:
+      - identity / self-referencing entries (failed workers bank {k: 1}):
+        skipped, never re-queued (the full-fixpoint version spins on these).
+      - cycles (contract violations that slipped past the worker guard):
+        surfaced by the max_pops cap with a loud warning, like the full
+        version's 10000-pass cap.
     """
-    now = time.time()
-    prev = ''
-    if _ITER_CLOCK['n'] != iteration:
-        if _ITER_CLOCK['t'] is not None:
-            prev = (f" | Iter {_ITER_CLOCK['n']} took "
-                    f"{now - _ITER_CLOCK['t']:.1f}s")
-        _ITER_CLOCK['n'] = iteration
-        _ITER_CLOCK['t'] = now
-    return (f"[{time.strftime('%H:%M:%S')} Iter {iteration} "
-            f"+{now - _ITER_CLOCK['t']:.1f}s{prev}]")
+    # HIGHEST-FIRST ordering (2026-07-29): pop the highest key (smallest
+    # total-order key) first. Every rule rewrites strictly downward, so by the
+    # time a key is popped, ALL contributions to its coefficient have already
+    # accumulated -> each cached rule fires EXACTLY ONCE per fold (a plain
+    # stack re-fires a rule for every late-arriving contribution).
+    import heapq
+    from symmetry_route import tkey as _order_key
+    work = [(_order_key(k), k) for k in {k for k in new_keys if k in expr}]
+    if not work:
+        return expr, set()
+    heapq.heapify(work)
+    queued = {k for _, k in work}   # ONE heap entry per key (2026-07-29):
+    # without this, every RHS occurrence pushes a duplicate — the heap swells
+    # to millions of entries and skip-pop churn dwarfs the real work.
+    expr = dict(expr)
+    pops = 0       # all worklist pops (cycle cap)
+    apps = 0       # ACTUAL rule applications (each banked rule fires <= once)
+    while work:
+        pops += 1
+        if pops > max_pops:
+            # oversized batch (or, if it persists across many iterations, a
+            # cache cycle): CARRY the unfinished worklist over to the next
+            # iteration instead of discarding it — nothing is lost, each
+            # iteration stays bounded, and dispatch continues between chunks.
+            leftover = {k for _, k in work if k in expr}
+            print(f"[delta] startup/large batch: folding banked results in "
+                  f"chunks — {len(leftover)} keys still to fold, expr "
+                  f"currently {len(expr)} terms (normal during resume "
+                  f"expansion; a problem only if the key count stops "
+                  f"shrinking)", flush=True)
+            return {k: v for k, v in expr.items() if v}, leftover
+        _, k = heapq.heappop(work)
+        queued.discard(k)
+        if k not in expr:
+            continue          # entry substituted away by cancellation
+        rhs = cache.get(k)
+        if rhs is None or k in rhs:
+            continue          # identity/self-referencing entry: not a reduction
+        apps += 1
+        if apps % 10_000 == 0:
+            print(f"[delta]   ... {apps} rules applied, worklist {len(work)}, "
+                  f"expr {len(expr)} terms", flush=True)
+        co = expr.pop(k)
+        for j, cj in rhs.items():
+            v = (expr.get(j, 0) + co * cj) % prime
+            if v:
+                expr[j] = v
+                if j in cache and j not in queued:
+                    queued.add(j)
+                    heapq.heappush(work, (_order_key(j), j))
+            else:
+                expr.pop(j, None)
+    return {k: v for k, v in expr.items() if v}, set()
 
 
 def get_non_masters(expr):
@@ -143,111 +180,6 @@ def work_units(integrals):
         L, r, s = full_weight(i)
         total += L * 1_000_000 + r * 1000 + s
     return total
-
-
-# --------------------------------------------------------------------------
-# GREEDY worker dispatch (SAILIR_WORKER_GREEDY=1)
-#
-# greedy_worker.py runs reduction/greedy_reduce.py, the stripped width-1 build
-# certified 125/125 bit-identical. It needs its own arg builder, though NOT
-# because the v7/v9 line would crash it -- it parses with parse_known_args(),
-# so --beam_width and --no-tabu are silently IGNORED rather than rejected.
-# The reason is --v7-cpus, which is worse than ignored: greedy_worker.py PEEKS
-# it out of sys.argv before importing greedy_reduce, to size the thread caps
-# and the CPU affinity pin, and it DEFAULTS TO 8. Omit it and a worker takes an
-# 8-core pin inside a 1-CPU Condor slot -> over-subscription and a hold. The
-# certified wrapper passes --v7-cpus 1, so this does too.
-# --beam_width is dropped because there is no beam left to size.
-#
-# The env is PINNED, not forwarded. greedy_reduce refuses to start unless all
-# eight of these hold, and an UNSET var fails too (unset SAILIR_SECTOR_RANK
-# means rank 0 -- a different total order, i.e. a different search). Forwarding
-# "whatever the orchestrator happens to have" is how a run silently becomes a
-# configuration nobody validated: run_gr_hard_g1023_greedy.sh, for instance,
-# exports SAILIR_NM_PENALTY=0, while the certified build is 0.1.
-#
-# Pinning alone would SILENTLY override that 0, so a conflicting value is a
-# hard error instead. One configuration, no silent deviation.
-# PERFORMANCE, not semantics: the raw-equation LRU. The default cap thrashes
-# once |iraws| exceeds it -- a measured ~20x cliff -- so the certified wrapper
-# raises it. Results are identical either way, which is exactly why it is not
-# in greedy_reduce's guard and must not be forgotten here.
-_GREEDY_CERT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 'greedy_certified.json')
-with open(_GREEDY_CERT_PATH) as _f:
-    _GREEDY_CERT = json.load(_f)
-
-
-def _cert_keys(*secs):
-    return {k: v for sec in secs
-            for k, v in _GREEDY_CERT.get(sec, {}).items()
-            if not k.startswith('_')}
-
-
-# Read from the record, never re-typed here: greedy_reduce validates against
-# the SAME file, so the two cannot drift apart.
-_GREEDY_ENV = _cert_keys('env_set', 'env_model')
-_GREEDY_PERF_ENV = _cert_keys('env_set_perf')
-_GREEDY_MUST_UNSET = _GREEDY_CERT.get('env_must_be_unset', {}).get('names', [])
-_GREEDY_CERTIFIED = _cert_keys('cli')
-
-
-def greedy_selected():
-    return os.environ.get('SAILIR_WORKER_GREEDY') == '1'
-
-
-def greedy_check_certified(prime, v7_cpus, model_checkpoint):
-    """Refuse a greedy dispatch that is not the certified model+prime pair."""
-    bad = []
-    if prime != _GREEDY_CERTIFIED['prime']:
-        bad.append(f'  --prime {prime}  (certified {_GREEDY_CERTIFIED["prime"]}) '
-                   f'-- WRONG PRIME IS SILENT: no error, just wrong coefficients')
-    if v7_cpus != _GREEDY_CERTIFIED['v7_cpus']:
-        bad.append(f'  --v7-cpus {v7_cpus}  (certified '
-                   f'{_GREEDY_CERTIFIED["v7_cpus"]}) -- sizes the CPU pin')
-    tail = _GREEDY_CERTIFIED['checkpoint_tail']
-    if not str(model_checkpoint).replace('\\', '/').endswith(tail):
-        bad.append(f'  --model-checkpoint {model_checkpoint}\n'
-                   f'      (certified .../{tail}); the prime above is correct '
-                   f'ONLY for that checkpoint')
-    if bad:
-        raise SystemExit(
-            'SAILIR_WORKER_GREEDY=1 but this is not the certified '
-            'configuration:\n' + '\n'.join(bad) +
-            '\nThe greedy build was validated 125/125 against exactly this '
-            'model at this\nprime. Fix the command line, or run the v9 worker, '
-            'which is general.')
-
-
-def greedy_env_string():
-    """The pinned worker env, or a hard error if our own env contradicts it."""
-    bad = {k: os.environ[k] for k, v in _GREEDY_ENV.items()
-           if os.environ.get(k) not in (None, v)}
-    if bad:
-        raise SystemExit(
-            'SAILIR_WORKER_GREEDY=1 but this orchestrator env contradicts the\n'
-            'certified greedy configuration:\n' +
-            ''.join(f'  {k}={v!r}  (certified {_GREEDY_ENV[k]!r})\n'
-                    for k, v in sorted(bad.items())) +
-            'Unset these, or run the v9 worker instead. They are pinned rather\n'
-            'than forwarded so a greedy run is always the validated search.')
-    env = dict(_GREEDY_ENV)
-    # perf knob: honour an explicit override, else pin the certified value
-    for k, v in _GREEDY_PERF_ENV.items():
-        env[k] = os.environ.get(k, v)
-    return ' '.join(f'{k}={v}' for k, v in env.items())
-
-
-def greedy_worker_args(topology_dir, integral_str, output_file,
-                       model_checkpoint, max_steps, prime, v7_cpus,
-                       paper_masters_flag, resume_flag):
-    """The greedy CLI: --v7-cpus kept (it sizes the pin), --beam_width dropped."""
-    return (f' --topology {topology_dir} --integral=\'{integral_str}\''
-            f' --output {output_file}'
-            f' --model-checkpoint {model_checkpoint}'
-            f' --max_steps {max_steps}'
-            f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-            f'{paper_masters_flag}{resume_flag}')
 
 
 def create_condor_submit(work_dir, integral, job_name, output_file,
@@ -338,33 +270,13 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
         # (SUCCESS_TOTAL=1 total-weight single-step success, (r,s) maxweight
         # action-cap, GNU MKL layer + affinity pin so the worker stays <= request
         # on Condor). v7_cpus==1 => serial, no fork pool. Same CLI as v6.
-        # SAILIR_WORKER_V9=1 swaps in onestep_worker_v9.py. Its CLI is
-        # IDENTICAL to v7's (verified: 22 shared flags, zero differences) and it
-        # writes the same orchestrator-format result.pkl, so reaping is
-        # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
-        # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
-        # configuration validated at 125/125 and 300/300.
-        if greedy_selected():
-            # model+prime pair, checked here because the env guard cannot see
-            # CLI values -- a wrong prime is silent and passes every other check
-            greedy_check_certified(prime, v7_cpus, model_checkpoint)
-            worker_script = 'greedy_worker.py'
-            worker_args = greedy_worker_args(
-                topology_dir, integral_str, output_file, model_checkpoint,
-                max_steps, prime, v7_cpus, paper_masters_flag, resume_flag)
-        else:
-            worker_script = ('onestep_worker_v9.py'
-                             if os.environ.get('SAILIR_WORKER_V9') == '1'
-                             else 'onestep_worker_v7.py')
-            worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
-                           f' --output {output_file}'
-                           f' --model-checkpoint {model_checkpoint}'
-                           f' --beam_width {beam_width} --max_steps {max_steps}'
-                           f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                           f'{paper_masters_flag}{resume_flag}'
-                           # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
-                           # with no env equivalent, notably --no-tabu.
-                           f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
+        worker_script = 'onestep_worker_v7.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+                       f'{paper_masters_flag}{resume_flag}')
     elif use_v6_worker:
         # onestep_worker_v6.py: serial 1-cpu, beam_search_v6 underneath
         # (strip-passenger + LAZY_RS + iraws-keep-first=50 + tabu +
@@ -411,29 +323,6 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     if os.environ.get('SAILIR_TOPOLOGY'):
         _envs = (_envs + " " if _envs else "") + \
             f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
-    # GREEDY knobs, forwarded ONLY when explicitly set, so default runs stay
-    # byte-identical. Condor does not inherit our env and beam_search_v9 reads
-    # these AT IMPORT, so omitting one silently yields a different search:
-    # NM_PENALTY != 0 perturbs the argmax, i.e. width 1 stops being greedy.
-    # SAILIR_BEAM_SORT is LOAD-BEARING and easy to miss: the v7/v9 arg builder
-    # does NOT pass --beam-sort, and onestep_worker_v9.py defaults it to
-    # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
-    # measured, that variant logs p_top=0.0 at states where the model is at
-    # 0.9999 and drives nm to 15. It must be forwarded explicitly.
-    if greedy_selected():
-        # PINNED, not forwarded: greedy_reduce refuses to start outside this
-        # exact set, and an UNSET var fails too. Skip names already emitted
-        # above so a key is never assigned twice in one environment line.
-        _have = {kv.split('=', 1)[0] for kv in _envs.split()}
-        _pin = ' '.join(kv for kv in greedy_env_string().split()
-                        if kv.split('=', 1)[0] not in _have)
-        _envs = (_envs + " " if _envs else "") + _pin
-    else:
-        for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
-                   'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
-            if os.environ.get(_v) is not None:
-                _envs = (_envs + " " if _envs else "") + \
-                    f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     submit_content = f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -501,33 +390,13 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
         else:
             memory = memory_gb if memory_gb else 4
     if use_v7_worker:
-        # SAILIR_WORKER_V9=1 swaps in onestep_worker_v9.py. Its CLI is
-        # IDENTICAL to v7's (verified: 22 shared flags, zero differences) and it
-        # writes the same orchestrator-format result.pkl, so reaping is
-        # unchanged. v9 is REQUIRED for greedy: v7 contains no SAILIR_SCORE and
-        # no SAILIR_NM_PENALTY at all, so `--beam_width 1` under v7 is NOT the
-        # configuration validated at 125/125 and 300/300.
-        if greedy_selected():
-            # model+prime pair, checked here because the env guard cannot see
-            # CLI values -- a wrong prime is silent and passes every other check
-            greedy_check_certified(prime, v7_cpus, model_checkpoint)
-            worker_script = 'greedy_worker.py'
-            worker_args = greedy_worker_args(
-                topology_dir, integral_str, output_file, model_checkpoint,
-                max_steps, prime, v7_cpus, paper_masters_flag, resume_flag)
-        else:
-            worker_script = ('onestep_worker_v9.py'
-                             if os.environ.get('SAILIR_WORKER_V9') == '1'
-                             else 'onestep_worker_v7.py')
-            worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
-                           f' --output {output_file}'
-                           f' --model-checkpoint {model_checkpoint}'
-                           f' --beam_width {beam_width} --max_steps {max_steps}'
-                           f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
-                           f'{paper_masters_flag}{resume_flag}'
-                           # SAILIR_WORKER_EXTRA_FLAGS: empty by default. For flags
-                           # with no env equivalent, notably --no-tabu.
-                           f" {os.environ.get('SAILIR_WORKER_EXTRA_FLAGS','')}")
+        worker_script = 'onestep_worker_v7.py'
+        worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
+                       f' --output {output_file}'
+                       f' --model-checkpoint {model_checkpoint}'
+                       f' --beam_width {beam_width} --max_steps {max_steps}'
+                       f' --prime {prime} --device cpu -v --v7-cpus {v7_cpus}'
+                       f'{paper_masters_flag}{resume_flag}')
     elif use_v6_worker:
         worker_script = 'onestep_worker_v6.py'
         worker_args = (f' --topology {topology_dir} --integral=\'{integral_str}\''
@@ -577,29 +446,6 @@ def create_batch_submit(work_dir, batch, model_checkpoint, beam_width, max_steps
     if os.environ.get('SAILIR_TOPOLOGY'):
         _envs = (_envs + " " if _envs else "") + \
             f"SAILIR_TOPOLOGY={os.environ['SAILIR_TOPOLOGY']}"
-    # GREEDY knobs, forwarded ONLY when explicitly set, so default runs stay
-    # byte-identical. Condor does not inherit our env and beam_search_v9 reads
-    # these AT IMPORT, so omitting one silently yields a different search:
-    # NM_PENALTY != 0 perturbs the argmax, i.e. width 1 stops being greedy.
-    # SAILIR_BEAM_SORT is LOAD-BEARING and easy to miss: the v7/v9 arg builder
-    # does NOT pass --beam-sort, and onestep_worker_v9.py defaults it to
-    # 'weight'. Width 1 under 'weight' is WEIGHT-greedy, not model-greedy --
-    # measured, that variant logs p_top=0.0 at states where the model is at
-    # 0.9999 and drives nm to 15. It must be forwarded explicitly.
-    if greedy_selected():
-        # PINNED, not forwarded: greedy_reduce refuses to start outside this
-        # exact set, and an UNSET var fails too. Skip names already emitted
-        # above so a key is never assigned twice in one environment line.
-        _have = {kv.split('=', 1)[0] for kv in _envs.split()}
-        _pin = ' '.join(kv for kv in greedy_env_string().split()
-                        if kv.split('=', 1)[0] not in _have)
-        _envs = (_envs + " " if _envs else "") + _pin
-    else:
-        for _v in ('SAILIR_SCORE', 'SAILIR_NM_PENALTY', 'SAILIR_BEAM_TOTAL',
-                   'SAILIR_BEAM_SORT', 'SAILIR_WORKER_V9'):
-            if os.environ.get(_v) is not None:
-                _envs = (_envs + " " if _envs else "") + \
-                    f"{_v}={os.environ[_v]}"
     env_line = f'environment = "{_envs}"\n' if _envs else ''
     parts = [f"""universe = vanilla
 executable = {PYTHON_PATH}
@@ -745,35 +591,13 @@ def main():
                         help='Prime for modular arithmetic')
     parser.add_argument('--check-interval', type=int, default=5,
                         help='Seconds between job status checks')
-    parser.add_argument('--max-concurrent', type=int, default=10000,
+    parser.add_argument('--max-concurrent', type=int, default=1000,
                         help='Maximum concurrent Condor jobs')
     # PAPER DEFAULT: ON (trianglebox-paper recipe).
     parser.add_argument('--paper-masters-only', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Reduce to paper masters only (no corner integrals). '
                              'Default: ON (trianglebox paper recipe).')
-    parser.add_argument('--diverge-nm', type=int, default=0,
-                        help='Kill a worker whose non-master count reaches N '
-                             'and RETURN ITS SLOT (0 = off). A diverging worker '
-                             'never finishes and has no wall cap. The integral '
-                             'is recorded to work_dir/diverged_killed.jsonl and '
-                             'never resubmitted (otherwise the freed slot is '
-                             'immediately refilled by the same divergence).')
-    parser.add_argument('--diverged-from', type=str, action='append',
-                        default=None,
-                        help='Path to a PRIOR run\'s diverged/killed jsonl '
-                             '(diverged_killed.jsonl, or the external '
-                             'watchdog\'s killed_diverging.jsonl). Those '
-                             'integrals are seeded into the diverged set and '
-                             'NEVER dispatched. Repeatable. Without this a '
-                             'resumed run re-runs every known-divergent '
-                             'integral: they produced no result, so they are '
-                             'not in the cache -- measured 254 of 454 workers '
-                             '(56%%) on the g1023 round-2 resume.')
-    parser.add_argument('--diverge-mem-mb', type=int, default=0,
-                        help='Also kill on MemoryUsage >= this many MB '
-                             '(0 = off). One condor_q per iteration, not one '
-                             'per worker.')
     parser.add_argument('--straggler-timeout', type=int, default=3600,
                         help='Seconds of actual Condor RUN time (excluding queue wait) before a '
                              'job is considered a straggler (default 60 min)')
@@ -801,12 +625,7 @@ def main():
     # PAPER DEFAULT: mixed (trianglebox-paper recipe — two parallel sub-beams,
     # one sorted by max-weight, one by total sum of weights).
     parser.add_argument('--beam-sort', type=str, default='mixed',
-                        # 'prob' added 2026-09-07 for the GREEDY worker: at
-                        # --beam_width 1 with SAILIR_NM_PENALTY=0 the single
-                        # survivor is the model's plain argmax. It was absent
-                        # here, so `--beam-sort prob` used to die in argparse.
-                        choices=['weight', 'nterms', 'score', 'totalweight',
-                                 'mixed', 'prob'],
+                        choices=['weight', 'nterms', 'score', 'totalweight', 'mixed'],
                         help='Beam sort key for worker jobs. Default: mixed '
                              '(trianglebox paper recipe).')
     # PAPER DEFAULT: dedup OFF (trianglebox-paper recipe).
@@ -971,26 +790,20 @@ def main():
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
     straggler2_integrals = set()  # integrals that have hit the second-level escalation
     sym_memo = {}                 # integral -> symmetry rule (or None); Design 1 routing
+    _sym_memo_path = Path(args.work_dir) / 'sym_memo.pkl'
+    if _sym_memo_path.exists():
+        try:
+            with open(_sym_memo_path, 'rb') as _f:
+                sym_memo = pickle.load(_f)
+            print(f'[route] loaded {len(sym_memo)} persisted routing rules '
+                  f'from {_sym_memo_path}', flush=True)
+        except Exception as _e:
+            print(f'[route] could not load {_sym_memo_path}: {_e}', flush=True)
+    _sym_memo_saved = len(sym_memo)
     n_symmetry_routed = 0         # cumulative count of integrals routed free by symmetry
-    if args.use_symmetry:
-        # Compare against the STORE's own prod_point, not the literal 1009. The
-        # requirement is that transform coefficients and IBP coefficients live
-        # in the SAME field -- not that the field is 1009. Hardcoding the prime
-        # blocked the p101 model outright, even though the store can be rebuilt
-        # at 101 (symmetry_engine_GR.py, SAILIR_SYM_PRIME/SAILIR_SYM_Y; the
-        # 101 build gates ALL PASS with the same 204 sectors / 946 transforms).
-        # canonicalize_GR asserts the same agreement on its side.
-        import canonicalize_GR as _CG
-        _sp = _CG._STORE.get('prod_point', (None,))[0]
-        if _sp != args.prime:
-            raise SystemExit(
-                f'--use-symmetry: transform store is at p={_sp} but --prime is '
-                f'{args.prime}.\nTransform coefficients are rationals reduced '
-                f'mod p and must combine with IBP coefficients at the SAME '
-                f'prime.\nEither point SAILIR_SYM_STORE/SAILIR_SYM_PRIME at a '
-                f'store built for p={args.prime}, or run at p={_sp}.\n'
-                f'Store in use: {_CG._PKL}')
-        print(f'  [symmetry] store {_CG._PKL} at p={_sp} matches --prime', flush=True)
+    if args.use_symmetry and args.prime != 1009:
+        raise SystemExit('--use-symmetry requires --prime 1009 (symmetry_route/canonicalize '
+                         'transforms are built at p=1009).')
     if args.symmetry_staged:
         if not args.use_symmetry:
             raise SystemExit('--symmetry-staged requires --use-symmetry.')
@@ -1003,42 +816,6 @@ def main():
     # Pending is dropped (any in-flight workers should be condor_rm'd before
     # restarting the orchestrator). This is the orchestrator-level resume; the
     # worker-level resume (per-integral) is independent.
-    # Integrals abandoned as divergent: killed, slot returned, NEVER resubmitted.
-    diverged = set()
-    if args.diverged_from:
-        import re as _re2
-        _tagpat = _re2.compile(r'async_\d+_(.+)$')
-        for _p in args.diverged_from:
-            _n = 0
-            try:
-                for _l in open(_p, errors='ignore'):
-                    _l = _l.strip()
-                    if not _l:
-                        continue
-                    try:
-                        _d = json.loads(_l)
-                    except Exception:
-                        continue
-                    # integrated format records 'integral'; the external
-                    # watchdog recorded only the log basename async_<id>_<tag>
-                    _t = _d.get('integral')
-                    if not _t:
-                        _m = _tagpat.match(_d.get('log', ''))
-                        _t = _m.group(1) if _m else None
-                    if not _t:
-                        continue
-                    try:
-                        diverged.add(tuple(int(x) for x in
-                                           _t.replace(',', '_').split('_')))
-                        _n += 1
-                    except ValueError:
-                        pass
-            except OSError as _e:
-                print(f'  WARNING: --diverged-from {_p}: {_e}', flush=True)
-            print(f'[DIVERGED-FROM] {_n} integrals from {_p}', flush=True)
-        print(f'[DIVERGED-FROM] {len(diverged)} distinct integrals will never '
-              f'be dispatched', flush=True)
-
     if args.resume:
         import glob
         t_resume = time.time()
@@ -1077,6 +854,16 @@ def main():
         expr = apply_substitutions(expr, cache, args.prime)
         print(f'[RESUME] Applied substitutions to expr in {time.time()-t_apply:.1f}s; '
               f'|expr|={len(expr)}, |cache|={len(cache)}', flush=True)
+        # GC-freeze the loaded bulk (2026-07-29): with ~10^5 cached rules
+        # (millions of small dicts/tuples) a full gen-2 collection scans them
+        # all and stalls the loop for minutes. Freezing moves live objects to
+        # a permanent generation the collector never rescans; refcount
+        # reclamation is unaffected. Refreshed periodically in the loop so
+        # newly banked results graduate out of scanning too.
+        import gc
+        gc.collect()
+        gc.freeze()
+        print(f'[gc] froze {gc.get_freeze_count()} objects (excluded from future collections)', flush=True)
 
     # --resume-from: round-2 mode. Load a PRIOR round's cache read-only; new
     # results still write to work_dir. Prefer the prior dir's replay_state.pkl
@@ -1168,12 +955,34 @@ def main():
     start_time = time.time()
 
     iteration = 0
+    # Incremental substitution (2026-07-27): keys added to the cache since the
+    # last top-of-iteration pass. The startup/resume full fixpoint has already
+    # run, so expr contains no cached keys; each iteration only needs to fold
+    # in the NEW results (worklist chains through the full cache). Equivalent
+    # to the full pass under the loop invariant — see apply_substitutions_delta.
+    delta_keys = set()
+    _ext_running = set()          # integrals run by jobs we did not submit
+    _ext_snapshot_ts = 0.0
+    import gc as _gc
     while True:
         iteration += 1
+        if iteration % 200 == 0:
+            _gc.collect()
+            _gc.freeze()      # graduate accumulated long-lived objects
 
-        # Apply all cached substitutions to the expression
+        # Apply cached substitutions. Default: PROVEN full fixpoint every
+        # iteration. SAILIR_DELTA_SUBS=1 enables the incremental worklist
+        # (2026-07-28: DISABLED pending root-cause of the resume-invariant
+        # failure — the startup full pass does not establish the no-cached-
+        # keys invariant the delta method requires; a resumed g1023 re-
+        # expanded from scratch and re-dispatched banked integrals).
         old_size = len(expr)
-        expr = apply_substitutions(expr, cache, args.prime)
+        if os.environ.get('SAILIR_DELTA_SUBS', '0') == '1':
+            expr, delta_keys = apply_substitutions_delta(
+                expr, cache, delta_keys, args.prime)
+        else:
+            expr = apply_substitutions(expr, cache, args.prime)
+            delta_keys = set()
 
         # DESIGN 1 symmetry routing: reduce every symmetry-reducible non-master for
         # FREE (strictly-lowering rewrite -> cache, no worker) and cascade the
@@ -1199,54 +1008,71 @@ def main():
             while True:
                 cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
                 routed = 0
-                # PARALLEL ROUTING, restored from
-                # hierarchical_reduction.py.bak-pre-harness-refactor (2026-07-30).
-                # The harness refactor kept the routing logic but DROPPED both
-                # parallel tiers, leaving only the serial fallback. _route is a pure
-                # function of the integral so it parallelizes exactly; measured
-                # ~4s/route on high-L integrals, which over a ~680k frontier is WEEKS
-                # single-threaded -- the reason --use-symmetry was unusable in process.
-                _new_c = [I_ for I_ in cand if I_ not in sym_memo]
+                routed_keys = set()
+                # PARALLEL ROUTING (2026-07-29): _route is a pure function of
+                # the integral; compute all un-memoized candidates in a fork
+                # pool (children inherit the loaded topology tables). Results
+                # merge into sym_memo deterministically.
+                _new_c = [I for I in cand if I not in sym_memo]
                 if (os.environ.get('SAILIR_ROUTE_CONDOR', '0') == '1'
                         and len(_new_c) >= 1000):
-                    # CONDOR routing: 100-integral closure batches; workers return
-                    # COMPOSED rules over survivors, so intermediates never enter
-                    # the fold/cache/GC.
+                    # CONDOR routing (2026-07-30): 100-integral closure
+                    # batches; workers return COMPOSED rules over survivors,
+                    # so intermediates never enter the fold/cache/GC.
                     from routing_condor import route_batch_condor
-                    print(f"[route] {len(_new_c)} candidates -> Condor batches", flush=True)
                     sym_memo.update(route_batch_condor(
                         _new_c, str(work_dir), f"i{iteration}"))
-                elif len(_new_c) > 64:
+                elif len(_new_c) > 64:   # measured ~4s/route on
+                    # high-L integrals (2026-07-30): pool pays off fast
                     import multiprocessing as _mp
                     _np = min(16, os.cpu_count() or 8)
-                    print(f"[route] routing {len(_new_c)} new candidates on {_np} cores",
-                          flush=True)
+                    print(f"[route] routing {len(_new_c)} new candidates on "
+                          f"{_np} cores ...", flush=True)
                     with _mp.Pool(_np) as _pool:
                         for _i, _rule in enumerate(
                                 _pool.imap(_route, _new_c, chunksize=100)):
                             sym_memo[_new_c[_i]] = _rule
                             if (_i + 1) % 5000 == 0:
-                                print(f"[route]   ... {_i+1}/{len(_new_c)} routed",
-                                      flush=True)
+                                print(f"[route]   ... {_i + 1}/{len(_new_c)} "
+                                      f"routed", flush=True)
                 else:
                     import time as _tm
                     _t0r = _tm.time()
-                    for _ir, I_ in enumerate(_new_c):
-                        sym_memo[I_] = _route(I_)
+                    for _ir, I in enumerate(_new_c):
+                        sym_memo[I] = _route(I)
                         if (_ir + 1) % 50 == 0:
-                            print(f"[route]   ... {_ir+1}/{len(_new_c)} routed serially, "
-                                  f"{_tm.time()-_t0r:.0f}s", flush=True)
+                            print(f"[route]   ... {_ir + 1}/{len(_new_c)} "
+                                  f"routed serially, {_tm.time() - _t0r:.0f}s",
+                                  flush=True)
                 for I in cand:
                     rule = sym_memo[I]
                     if rule is not None:            # {} (symmetry-zero) or strictly-lower rewrite
                         cache[I] = rule; routed += 1
+                        routed_keys.add(I)
                 if not routed:
                     break
                 routed_this_iter += routed
-                expr = apply_substitutions(expr, cache, args.prime)
+                if os.environ.get('SAILIR_DELTA_SUBS', '0') == '1':
+                    expr, _left = apply_substitutions_delta(
+                        expr, cache, routed_keys, args.prime)
+                    delta_keys |= _left
+                else:
+                    expr = apply_substitutions(expr, cache, args.prime)
             if routed_this_iter:
                 n_symmetry_routed += routed_this_iter
-                print(f"{_iter_tag(iteration)} symmetry-routed {routed_this_iter} integrals free "
+            # persist the routing table when it has grown appreciably
+            if len(sym_memo) - _sym_memo_saved >= 1000:
+                try:
+                    _tmp = str(_sym_memo_path) + '.tmp'
+                    with open(_tmp, 'wb') as _f:
+                        pickle.dump(sym_memo, _f)
+                    os.replace(_tmp, _sym_memo_path)
+                    _sym_memo_saved = len(sym_memo)
+                    print(f'[route] persisted {len(sym_memo)} routing rules',
+                          flush=True)
+                except Exception:
+                    pass
+                print(f"[Iter {iteration}] symmetry-routed {routed_this_iter} integrals free "
                       f"({n_symmetry_routed} cumulative)", flush=True)
 
         # Count cache hits (integrals that were substituted)
@@ -1283,7 +1109,7 @@ def main():
                     pass
                 for integral in obsolete_integrals:
                     del pending[integral]
-                print(f"{_iter_tag(iteration)} Cancelled {len(obsolete_integrals)} pending jobs "
+                print(f"[Iter {iteration}] Cancelled {len(obsolete_integrals)} pending jobs "
                       f"(idle+running) whose integrals are no longer needed", flush=True)
 
         # Find non-masters that need reduction
@@ -1291,12 +1117,77 @@ def main():
 
         # Integrals to submit: non-masters not in cache and not pending
         to_submit = non_masters - set(cache.keys()) - set(pending.keys())
-        # Integrals abandoned as DIVERGENT are never resubmitted. Without this
-        # the kill would free the slot and the very next iteration would
-        # resubmit the same integral, which would diverge again -- an infinite
-        # kill/resubmit loop.
-        if diverged:
-            to_submit = to_submit - diverged
+        # HOLD SUBMISSIONS while a chunked substitution batch is still being
+        # folded (delta_keys nonempty = carry-over pending): the expression is
+        # a partial state and any priority choice from it is premature. Fold
+        # first, dispatch after (2026-07-28).
+        if delta_keys and to_submit:
+            print(f"[delta] holding submissions — {len(delta_keys)} keys "
+                  f"still folding", flush=True)
+            to_submit = set()
+
+        # EXTERNAL-WORKER DEDUPE (2026-07-29). The pending table only covers
+        # jobs THIS orchestrator submitted; workers from prior orchestrator
+        # generations ("orphans") keep running and banking results invisibly.
+        if to_submit:
+            # (1) results already on disk (banked after our startup scan):
+            #     ingest instead of resubmitting.
+            _rd = work_dir / 'results'
+            _on_disk = {}
+            for _fn in os.listdir(_rd):
+                if not (_fn.startswith('async_') and _fn.endswith('.pkl')):
+                    continue
+                _cut = _fn[6:-4].split('_', 1)
+                if len(_cut) != 2:
+                    continue
+                try:
+                    _tup = tuple(int(x) for x in _cut[1].split('_'))
+                except ValueError:
+                    continue
+                _on_disk[_tup] = _fn
+            _banked = [i for i in to_submit if i in _on_disk]
+            for _integ in _banked:
+                try:
+                    with open(_rd / _on_disk[_integ], 'rb') as _f:
+                        _r = pickle.load(_f)
+                    if _r.get('success'):
+                        cache[_integ] = _r.get('final_expr', {_integ: 1})
+                    else:
+                        cache[_integ] = {_integ: 1}
+                    delta_keys.add(_integ)
+                    to_submit.discard(_integ)
+                except Exception:
+                    pass
+            if _banked:
+                print(f"[dedupe] {len(_banked)} candidates already banked by "
+                      f"external workers — ingested, not resubmitted",
+                      flush=True)
+            # (2) integrals other queued Condor jobs are already running:
+            #     skip while those jobs live (snapshot refreshed ~60s).
+            if time.time() - _ext_snapshot_ts > 60:
+                try:
+                    _q = subprocess.run(
+                        ['condor_q', os.environ.get('USER', 'dshih'),
+                         '-af', 'Args'],
+                        capture_output=True, text=True, timeout=60).stdout
+                    _ext_running = set()
+                    for _ln in _q.splitlines():
+                        if "--integral='" not in _ln:
+                            continue
+                        _iv = _ln.split("--integral='")[1].split("'")[0]
+                        try:
+                            _ext_running.add(
+                                tuple(int(x) for x in _iv.split(',')))
+                        except ValueError:
+                            pass
+                    _ext_snapshot_ts = time.time()
+                except Exception:
+                    pass          # keep the previous snapshot on failure
+            _skip = to_submit & _ext_running - set(pending.keys())
+            if _skip:
+                to_submit -= _skip
+                print(f"[dedupe] {len(_skip)} candidates already being run "
+                      f"by external workers — skipped", flush=True)
 
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
@@ -1373,96 +1264,25 @@ def main():
                       f"got {n_submitted}/{len(batch)}); will retry next iteration")
 
         if newly_submitted > 0:
-            print(f"{_iter_tag(iteration)} Submitted {newly_submitted} jobs")
+            print(f"[Iter {iteration}] Submitted {newly_submitted} jobs")
 
-        # Check if done
-        if not pending and not to_submit:
+        # Check if done. NOT while a chunked folding carry is outstanding:
+        # the submission hold empties to_submit during folding, and a freshly
+        # resumed orchestrator has no pending — without the delta_keys guard
+        # that combination false-fires completion at Iter 1 (v9 incident,
+        # 2026-07-28). Full-fixpoint mode always has delta_keys empty, so
+        # legacy endings (incl. finish-with-warning on failed integrals) are
+        # unchanged.
+        if not pending and not to_submit and not delta_keys:
             print(f"\n[Iter {iteration}] All done!")
             break
 
         if args.dry_run:
-            print(f"{_iter_tag(iteration)} Dry run - stopping after job creation")
+            print(f"[Iter {iteration}] Dry run - stopping after job creation")
             break
 
         # Wait a bit
         time.sleep(args.check_interval)
-
-        # ── DIVERGENCE SWEEP ────────────────────────────────────────────
-        # A diverging worker never finishes: non-masters and the substitution
-        # store grow without bound (measured on g1023: nm 2261 from a start of
-        # 3, weight r=215 from 11, store 592k). Workers have NO wall cap, so
-        # each one holds a CPU forever.
-        #
-        # CRITICAL DIFFERENCE from the external watchdog this replaces: the
-        # entry is DELETED FROM `pending`, so the slot is returned. The
-        # external version could only condor_rm, leaving the entry forever --
-        # `available_slots = max_concurrent - len(pending)` then decays to zero
-        # and the orchestrator stops submitting. Measured: 625 of 1000 slots
-        # dead after 7 h, only 210 real jobs on the cluster.
-        if args.diverge_nm > 0 and pending:
-            mem = {}
-            if args.diverge_mem_mb > 0:
-                try:
-                    _r = subprocess.run(
-                        ['condor_q', '-af:,', 'ClusterId', 'ProcId',
-                         'MemoryUsage'], capture_output=True, text=True,
-                        timeout=60)
-                    for _l in _r.stdout.splitlines():
-                        _f = [x.strip() for x in _l.split(',')]
-                        if len(_f) >= 3:
-                            try:
-                                mem[f'{_f[0]}.{_f[1]}'] = int(float(_f[2]))
-                            except ValueError:
-                                pass
-                except Exception:
-                    pass
-            _rm, _rec = [], []
-            for integral, (cluster_id, output_file, _st, _cp) in list(pending.items()):
-                if not cluster_id or output_file.exists():
-                    continue
-                wlog = work_dir / 'logs' / (Path(output_file).stem + '.out')
-                if not wlog.exists():
-                    continue
-                try:
-                    txt = wlog.read_text(errors='ignore')
-                except Exception:
-                    continue
-                if 'SUCCESS in' in txt or 'INCOMPLETE in' in txt:
-                    continue
-                hits = _DIVERGE_LINE.findall(txt)
-                if not hits:
-                    continue
-                step, wr, ws, nm, rsv, tt = hits[-1]
-                why = []
-                if int(nm) >= args.diverge_nm:
-                    why.append(f'nm>={args.diverge_nm}')
-                mb = mem.get(str(cluster_id), 0)
-                if args.diverge_mem_mb > 0 and mb >= args.diverge_mem_mb:
-                    why.append(f'mem>={args.diverge_mem_mb}MB')
-                if not why:
-                    continue
-                _rm.append(str(cluster_id))
-                _rec.append(dict(integral=integral_to_str(integral),
-                                 cluster=str(cluster_id), reason='+'.join(why),
-                                 nm=int(nm), nm_start=int(hits[0][3]),
-                                 max_w_r=int(wr), max_w_r_start=int(hits[0][1]),
-                                 step=int(step), rs_vsz=int(rsv), mem_mb=mb,
-                                 t_total=float(tt), iteration=iteration,
-                                 killed_at=time.strftime('%F %T')))
-                diverged.add(integral)
-                del pending[integral]          # <-- returns the slot
-            if _rm:
-                try:
-                    subprocess.run(['condor_rm'] + _rm, capture_output=True,
-                                   text=True, timeout=180)
-                except Exception:
-                    pass
-                with open(work_dir / 'diverged_killed.jsonl', 'a') as _fh:
-                    for _d in _rec:
-                        _fh.write(json.dumps(_d) + chr(10))
-                print(f"{_iter_tag(iteration)} DIVERGENCE: killed {len(_rm)} "
-                      f"(total {len(diverged)}); slots returned to the pool",
-                      flush=True)
 
         # Check for stragglers (jobs that have been RUNNING on Condor too long
         # — queue/idle wait time is excluded). Resubmit them with more CPUs.
@@ -1625,6 +1445,7 @@ def main():
                         # Cache the reduction: integral -> result expression
                         result_expr = result.get('final_expr', result.get('expr', {}))
                         cache[integral] = result_expr
+                        delta_keys.add(integral)
                         steps = result.get('steps', 0)
                         total_steps += steps
                         worker_time = result.get('time', 0)
@@ -1724,15 +1545,17 @@ def main():
                     eta_sec = work / rate if rate > 0 else 0
                     eta_str = f"-{dw/dt*60:.0f}/min, ETA {eta_sec/3600:.1f}h"
 
-            print(f"{_iter_tag(iteration)} {masters_count} masters, {non_masters_count} non-masters | "
+            print(f"[Iter {iteration}] {masters_count} masters, {non_masters_count} non-masters | "
                   f"frontier=(L={frontier[0]},r={frontier[1]},s={frontier[2]}) x {n_at_frontier} | "
                   f"work={work} ({eta_str}) | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits} | "
+                  f"t={time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"           [hist] {hist_str}")
             print(f"           [maxw] {maxw_str}")
         else:
-            print(f"{_iter_tag(iteration)} {masters_count} masters, 0 non-masters | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+            print(f"[Iter {iteration}] {masters_count} masters, 0 non-masters | "
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits} | "
+                  f"t={time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Final substitution
     expr = apply_substitutions(expr, cache, args.prime)

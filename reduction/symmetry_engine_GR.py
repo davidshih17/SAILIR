@@ -41,8 +41,24 @@ ROOT = "/het/p4/dshih/jet_images-deep_learning/SAILIR_phase2"
 sys.path.insert(0, ROOT)
 
 N_IND, N_DEN, N_LOOP = 15, 10, 3
-PROD = (1009, 31)                       # production (p, y)
-CHECK = (2003, 17)                      # independent second point
+# PROD/CHECK are overridable so the store can be rebuilt at the MODEL's prime.
+# The p101 model was trained on a corpus generated entirely at 101; the
+# orchestrator refuses --use-symmetry unless --prime matches the store's point,
+# because a transform's coefficients are rationals reduced mod p and must
+# combine with IBP coefficients at the SAME prime. Defaults unchanged, so an
+# unset environment reproduces the validated (1009, 31) store exactly.
+#
+# CHECK is the independent second point that kills accidental mod-p zeros. It
+# MUST stay a different prime from PROD -- at p=101 spurious cancellation is far
+# likelier than at 1009, so this check matters MORE for a small prime, not less.
+PROD = (int(os.environ.get('SAILIR_SYM_PRIME', 1009)),
+        int(os.environ.get('SAILIR_SYM_Y', 31)))
+CHECK = (int(os.environ.get('SAILIR_SYM_CHECK_PRIME', 2003)),
+         int(os.environ.get('SAILIR_SYM_CHECK_Y', 17)))
+if PROD[0] == CHECK[0]:
+    raise SystemExit(f'PROD and CHECK must use DIFFERENT primes '
+                     f'(got {PROD[0]} for both) -- the second point exists to '
+                     f'detect accidental mod-p zeros and is useless at the same p.')
 
 # ---- scalar-product basis: index 0..14 ----
 # kk: (0,0)(0,1)(0,2)(1,1)(1,2)(2,2) -> 0..5 ; kq: 6..8 ; ku1: 9..11 ; ku2: 12..14
@@ -497,9 +513,10 @@ def build_and_gate():
 
     out = {"by_sector": by_sector, "gates": stats,
            "prod_point": PROD, "check_point": CHECK}
-    with open(os.path.join(ROOT, "results/gr_transforms.pkl"), "wb") as f:
+    _out = os.environ.get('SAILIR_SYM_OUT', 'results/gr_transforms.pkl')
+    with open(os.path.join(ROOT, _out), "wb") as f:
         pickle.dump(out, f)
-    print("saved -> results/gr_transforms.pkl")
+    print(f"saved -> {_out}  (prod_point={PROD} check_point={CHECK})")
     ok = stats['real_gate_fail'] == 0 and not stats['ph_unmatched']
     print("ALL PASS" if ok else "GATE INCOMPLETE (see above)")
     return out
