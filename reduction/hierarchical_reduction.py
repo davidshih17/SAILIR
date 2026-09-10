@@ -134,17 +134,6 @@ def full_weight(integral):
     return (level, r, s)
 
 
-def work_units(integrals):
-    """Scalar progress metric: large enough field for each component that
-    level dominates r, r dominates s — no collisions across realistic
-    pentagon-box ranges (level<=8, r<=20, s<=20)."""
-    total = 0
-    for i in integrals:
-        L, r, s = full_weight(i)
-        total += L * 1_000_000 + r * 1000 + s
-    return total
-
-
 # --------------------------------------------------------------------------
 # GREEDY worker dispatch (SAILIR_WORKER_GREEDY=1)
 #
@@ -1636,23 +1625,37 @@ def main():
 
         # Frontier: max full_weight tuple still pending, and count at that tuple.
         if non_masters:
-            frontier = max(full_weight(i) for i in non_masters)
-            n_at_frontier = sum(1 for i in non_masters if full_weight(i) == frontier)
-            work = work_units(non_masters)
-
-            # Top-N (L, r) buckets — collapse s since it's secondary.
+            # ONE PASS, NOT FOUR. This block is pure logging, and it used to
+            # sweep non_masters four separate times -- max(full_weight), a
+            # second scan counting equals, work_units, then the bucket loop --
+            # i.e. ~4 full_weight calls per integral. Over a 1.2M-term
+            # expression that is ~5 MILLION weight() calls per iteration, and
+            # py-spy put 37% of orchestrator samples inside weight() with
+            # another 45% in apply_substitutions. Everything below is derivable
+            # from a single pass, so take it.
+            #
+            # Deliberately NOT memoizing weight(): a cache keyed by integral
+            # would grow with the expression (1.2M+ entries) for a value this
+            # now computes once per integral per iteration anyway. Memory-
+            # neutral beats memory-for-speed when the compute is already O(n).
             Lr_counts = {}
-            # Per-level: count of non-masters and max (r, s) weight.
             L_counts = {}
             L_maxw = {}
+            fw_counts = {}
+            work = 0
             for i in non_masters:
-                L, r, s_ = full_weight(i)
+                fw = full_weight(i)
+                L, r, s_ = fw
+                work += L * 1_000_000 + r * 1000 + s_
+                fw_counts[fw] = fw_counts.get(fw, 0) + 1
                 key = (L, r)
                 Lr_counts[key] = Lr_counts.get(key, 0) + 1
                 L_counts[L] = L_counts.get(L, 0) + 1
                 prev = L_maxw.get(L)
                 if prev is None or (r, s_) > prev:
                     L_maxw[L] = (r, s_)
+            frontier = max(fw_counts) if fw_counts else (0, 0, 0)
+            n_at_frontier = fw_counts.get(frontier, 0)
             top = sorted(Lr_counts.items(), key=lambda kv: (-kv[0][0], -kv[0][1]))[:15]
             hist_str = " ".join(f"L{L}r{r}:{n}" for (L, r), n in top)
             # Per-level max-weight summary, highest level first.
