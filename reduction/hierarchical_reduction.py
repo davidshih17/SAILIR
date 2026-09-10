@@ -58,30 +58,60 @@ def apply_substitutions(expr, cache, prime):
     This recursively substitutes any integral that's in the cache with its
     reduced form, until only masters and un-cached integrals remain.
     """
-    changed = True
-    iterations = 0
-    while changed:
-        changed = False
-        iterations += 1
-        new_expr = {}
-        for integral, coeff in expr.items():
-            if coeff == 0:
-                continue
-            if integral in cache:
-                # Substitute: integral -> cache[integral]
-                for sub_int, sub_coeff in cache[integral].items():
-                    if sub_coeff == 0:
-                        continue
-                    new_expr[sub_int] = (new_expr.get(sub_int, 0) + coeff * sub_coeff) % prime
-                changed = True
-            else:
-                new_expr[integral] = (new_expr.get(integral, 0) + coeff) % prime
-        expr = {k: v for k, v in new_expr.items() if v != 0}
-
-        # Safety check
-        if iterations > 10000:
-            print(f"WARNING: apply_substitutions exceeded 10000 iterations")
+    # WORKLIST, NOT REBUILD-UNTIL-FIXPOINT. The previous implementation looped
+    # `while changed`, and each pass copied EVERY term of the expression into a
+    # fresh dict and then filtered that into another one -- so an expression of
+    # 1.25M terms paid 2 x 1.25M dict operations per pass, however few terms
+    # actually had a cache entry. Measured on the live campaign: 100 of 100
+    # py-spy samples landed in this function (33% on the untouched-term copy,
+    # 31% on the filter rebuild), iterations stretched to 549s, and the Condor
+    # queue drained to zero waiting for the orchestrator to submit again.
+    #
+    # Only terms that ARE in the cache can change, and substituting one can only
+    # introduce the terms named in its rule. So seed a worklist with
+    # expr.keys() & cache.keys() and propagate: cost becomes proportional to the
+    # terms actually touched, not to the size of the expression.
+    #
+    # Same fixpoint: routing/reduction rules are strictly descending, so the
+    # substitution graph is a DAG and the worklist drains. A self-referential
+    # entry (cache[i] == {i: 1}, written for a FAILED worker) would re-enqueue
+    # itself forever, so it is skipped explicitly -- the old code relied on its
+    # 10000-iteration guard for that, which silently did 10000 full rebuilds.
+    expr = {k: v % prime for k, v in expr.items() if v % prime}
+    todo = [k for k in expr if k in cache]
+    seen_guard = 0
+    while todo:
+        seen_guard += 1
+        if seen_guard > 10_000_000:
+            print("WARNING: apply_substitutions worklist exceeded 10M steps",
+                  flush=True)
             break
+        nxt = []
+        for k in todo:
+            rule = cache.get(k)
+            if rule is None:
+                continue
+            coeff = expr.pop(k, 0)
+            if not coeff:
+                continue
+            if len(rule) == 1 and k in rule:
+                # identity entry (failed worker): substituting is a no-op that
+                # would re-enqueue k forever. Keep the term as it stands.
+                expr[k] = (expr.get(k, 0) + coeff * rule[k]) % prime
+                if not expr[k]:
+                    del expr[k]
+                continue
+            for sub_int, sub_coeff in rule.items():
+                if not sub_coeff:
+                    continue
+                v = (expr.get(sub_int, 0) + coeff * sub_coeff) % prime
+                if v:
+                    expr[sub_int] = v
+                    if sub_int in cache and sub_int != k:
+                        nxt.append(sub_int)
+                else:
+                    expr.pop(sub_int, None)
+        todo = nxt
 
     return expr
 
