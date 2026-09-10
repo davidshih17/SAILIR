@@ -145,6 +145,14 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
 
             signal.signal(signal.SIGALRM, _sym_alarm)
             signal.alarm(_tl)
+        # START MARKER. Every other sym-first line is printed AFTER the route
+        # returns, so without this a worker stuck in the route logs NOTHING and
+        # the silence is indistinguishable from a slow import, model load or
+        # beam-search start. With it, the rule is simple: this line with no
+        # following [sym-first] line means the route is still running -- and if
+        # the gap exceeds the limit, the limit is NOT working.
+        print(f'[sym-first] routing {",".join(str(x) for x in I)} '
+              f'(limit {_tl}s) ...', flush=True)
         try:
             rule = canonical_monolithic_rule(I)
         except TimeoutError:
