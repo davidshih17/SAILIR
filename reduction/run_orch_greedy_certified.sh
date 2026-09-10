@@ -52,8 +52,31 @@ eval "$($PYTHON $B/scripts/greedy_env.py --export | grep SAILIR_TOPOLOGY)"
 # SECTOR table needs no rebuild: rebuilding it from the 101 store reproduced
 # results/canonical_sectors_GR_v2.pkl byte-identically, because sector
 # canonicalization depends on WHICH maps exist, not on the field.
-export SAILIR_SYM_PRIME=101
-export SAILIR_SYM_STORE=results/gr_transforms_p101.pkl
+# The ORCHESTRATOR's own env, not just the workers'. routing_condor builds the
+# routing worker.sh from os.environ, so anything missing here is silently
+# defaulted into 7,144 jobs -- SAILIR_SECTOR_RANK absent meant it wrote =0 and
+# every routing worker asserted on arrival.
+export SAILIR_SECTOR_RANK=1
+# THE STORE THAT IS ACTUALLY READ. topo_config.canonicalize_module() returns
+# canonicalize2 for gravity3L -- NOT canonicalize_GR -- and canonicalize2 takes
+# BOTH its transforms and its prime from this store's prod_point. Pointing here
+# moves the whole symmetry layer (symmetry_route, sector_canon_maps,
+# canonical_masters) to p=101 with one variable.
+# results/gr_transforms*.pkl belongs to the GR-specific engine and is used only
+# as gate_engine2's reference; setting it here did nothing for routing.
+export SAILIR_SYM_STORE=results/gravity3L_transforms_v2_p101.pkl
+
+# Discard any symmetry route producing more than this many terms and let a
+# worker reduce the integral instead. Measured on the real frontier: s=20 gave
+# a 1,315,600-term rule against a 714,538-term expression (8 masters in it),
+# while IBP emits a median of 6-8 terms. The blowup is bimodal and NOT
+# monotonic in s -- s=24 routed to 1 term, and the >=20 bucket was
+# {1, 15, 28, 1315600} -- so the cap must be on the OUTPUT, not on s.
+export SAILIR_ROUTE_MAX_TERMS=200
+# Numerator-degree gate on routing. Checked BEFORE the expansion, so a skipped
+# integral costs nothing -- MAX_TERMS only rejects after the terms are built.
+# s is a proxy for predictability, not a cause; see greedy_certified.json.
+export SAILIR_ROUTE_MAX_S=5
 
 export SAILIR_ROUTE_CONDOR=1
 export SAILIR_DELTA_SUBS=1

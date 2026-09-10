@@ -10,6 +10,7 @@ single-term with coefficient exactly +1, no constant, landing in a denominator
 slot — flip maps are not value identities for eikonal (linear) denominators.
 Numerator rows keep full coefficients. Kira's det sign is never applied.
 """
+import os
 import pickle
 import topo_config as _tc
 
@@ -37,6 +38,9 @@ def _transforms(K):
         if (S & sK) == sK:
             for mc in mcs:
                 yield mc
+
+
+_MAX_EXPAND = int(os.environ.get('SAILIR_ROUTE_MAX_EXPAND', '0'))
 
 
 def image_unsigned(a, M, c):
@@ -70,6 +74,23 @@ def image_unsigned(a, M, c):
                 if const:
                     new[integ] = (new.get(integ, 0) + co * const) % p
             res = {k: v for k, v in new.items() if v % p}
+            # COMPUTE CAP. A term-count cap applied to the RETURNED rule stops
+            # the expression from growing but saves no time -- the giant
+            # expansion is still built, then discarded. Measured on the real
+            # frontier: an s=20 integral expands to 1,315,600 terms. Bailing
+            # here abandons the expansion as soon as it is clearly headed there.
+            #
+            # None already means "this transform does not apply" and every
+            # caller treats it as skip-and-continue, so an over-cap map is
+            # simply not used -- the integral falls through to worker dispatch.
+            #
+            # Deliberately MUCH larger than the returned-rule cap: cancellation
+            # in the `% p` filter can shrink res between passes, so a route with
+            # a small final rule may spike mid-expansion. A generous ceiling
+            # rejects only genuine explosions. 0 disables (exact prior
+            # behaviour, which is the default).
+            if _MAX_EXPAND and len(res) > _MAX_EXPAND:
+                return None
     return res
 
 

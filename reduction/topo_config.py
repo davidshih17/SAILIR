@@ -82,7 +82,18 @@ N_IND = _c['N_IND']
 N_DEN = _c['N_DEN']
 TOPO_DIR = _c['TOPO_DIR']
 CANON_PKL = _c['CANON_PKL']
-STORE_PKL = _c['STORE_PKL']
+# SAILIR_SYM_STORE overrides the transform store, so a run can use a store
+# built at the MODEL's prime. canonicalize2 derives its P from the store's
+# prod_point, so pointing this at the p=101 store moves the ENTIRE symmetry
+# layer to 101 consistently -- symmetry_route, sector_canon_maps and
+# canonical_masters all read P from canonicalize_module().
+# NOTE the earlier confusion this resolves: results/gr_transforms.pkl belongs to
+# the GR-SPECIFIC engine (canonicalize_GR), which gravity3L does NOT use --
+# topo_config.canonicalize_module() returns canonicalize2 here. This is the
+# store that is actually read.
+STORE_PKL = os.environ.get('SAILIR_SYM_STORE') or _c['STORE_PKL']
+if not os.path.isabs(STORE_PKL):
+    STORE_PKL = os.path.join(ROOT, STORE_PKL)
 # A/B-only overrides (behavioral gating of the general engine): swap the
 # canonicalize provider and redirect the composite-map cache so gate runs
 # never clobber production pkls. NOT for production runs.

@@ -1206,7 +1206,25 @@ def main():
                 # function of the integral so it parallelizes exactly; measured
                 # ~4s/route on high-L integrals, which over a ~680k frontier is WEEKS
                 # single-threaded -- the reason --use-symmetry was unusable in process.
-                _new_c = [I_ for I_ in cand if I_ not in sym_memo]
+                # Numerator-degree gate: skip routing above this s. Checked
+                # BEFORE _route, so a skipped integral costs nothing. s is a
+                # PROXY chosen for predictability -- everything sampled at s<=5
+                # gave small rules, while high s is bimodal (s=24 -> 1 term,
+                # s=20 -> 1,315,600). Skipped integrals go to worker dispatch.
+                _max_s = int(os.environ.get('SAILIR_ROUTE_MAX_S', '5'))
+                _skip_s = 0
+                _new_c = []
+                for I_ in cand:
+                    if I_ in sym_memo:
+                        continue
+                    if _max_s >= 0 and -sum(x for x in I_ if x < 0) > _max_s:
+                        sym_memo[I_] = None
+                        _skip_s += 1
+                        continue
+                    _new_c.append(I_)
+                if _skip_s:
+                    print(f"[route] skipped {_skip_s} integral(s) with "
+                          f"s>{_max_s} -> worker dispatch", flush=True)
                 if (os.environ.get('SAILIR_ROUTE_CONDOR', '0') == '1'
                         and len(_new_c) >= 1000):
                     # CONDOR routing: 100-integral closure batches; workers return
@@ -1236,14 +1254,28 @@ def main():
                         if (_ir + 1) % 50 == 0:
                             print(f"[route]   ... {_ir+1}/{len(_new_c)} routed serially, "
                                   f"{_tm.time()-_t0r:.0f}s", flush=True)
+                # SIZE CAP, same rule as routing_closure_worker: a route that
+                # produces more terms than this is expression GROWTH, not
+                # reduction (measured: s=20 -> 1,315,600 terms against a
+                # 714,538-term expression, 8 masters). Cap the OUTPUT, not s --
+                # the blowup is bimodal and not monotonic in s (s=24 -> 1 term,
+                # s=20 -> 1.3M). Over-cap integrals fall through to a worker.
+                _maxt = int(os.environ.get('SAILIR_ROUTE_MAX_TERMS', '200'))
+                _capped = 0
                 for I in cand:
                     rule = sym_memo[I]
+                    if rule is not None and len(rule) > _maxt:
+                        sym_memo[I] = rule = None
+                        _capped += 1
                     if rule is not None:            # {} (symmetry-zero) or strictly-lower rewrite
                         cache[I] = rule; routed += 1
                 if not routed:
                     break
                 routed_this_iter += routed
                 expr = apply_substitutions(expr, cache, args.prime)
+            if _capped:
+                print(f"  [route] capped {_capped} route(s) over {_maxt} terms "
+                      f"-> worker dispatch", flush=True)
             if routed_this_iter:
                 n_symmetry_routed += routed_this_iter
                 print(f"{_iter_tag(iteration)} symmetry-routed {routed_this_iter} integrals free "

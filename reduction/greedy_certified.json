@@ -19,7 +19,7 @@
     "against results/truth/finetune/gval, timing median 1.002x."
   ],
   "env_set": {
-    "_why": "Semantic. Wrong or missing -> a different search that still reports success.",
+    "_why": "Semantic. Wrong or missing -> a different search that still reports success. SAILIR_ROUTE_MAX_S gates symmetry routing by total numerator degree s: above it, an integral is not routed at all and goes to worker dispatch. s is a PROXY, not the cause -- routing cost comes from the CASCADE (canonical_monolithic_rule composes across transforms and recursively routes what it emits), and neither s nor the individual numerator powers predict it. Measured: s=24 with powers {3,7,14} routed to ONE term, s=16 with powers {8,1,7} gave 6,435, s=20 gave 1,315,600. What s buys is PREDICTABILITY and a check that costs nothing (it runs BEFORE the expansion, unlike SAILIR_ROUTE_MAX_TERMS which only rejects after the terms are built). Everything sampled at s<=5 produced small rules: 0, 1, 16, 45 terms. The price is forgoing cheap high-s wins like that s=24 single-term route.",
     "SAILIR_SUCCESS_TOTAL": "1",
     "SAILIR_BEAM_TOTAL": "1",
     "SAILIR_SECTOR_RANK": "1",
@@ -29,7 +29,9 @@
     "SAILIR_V9_CULL": "1",
     "SAILIR_NM_PENALTY": "0.1",
     "SAILIR_END_OF_STEP_TRIM": "1",
-    "SAILIR_TABU_CAP": "0"
+    "SAILIR_TABU_CAP": "0",
+    "SAILIR_ROUTE_MAX_TERMS": "200",
+    "SAILIR_ROUTE_MAX_S": "5"
   },
   "env_set_perf": {
     "_why": "Speed only, results identical. Not guarded as semantics, but a wrong value is a ~20x cliff, so it is still recorded and pinned.",
@@ -39,8 +41,7 @@
   "env_model": {
     "_why": "Tied to the checkpoint, not to the search.",
     "SAILIR_TOPOLOGY": "gravity3L",
-    "SAILIR_SYM_PRIME": "101",
-    "SAILIR_SYM_STORE": "results/gr_transforms_p101.pkl"
+    "SAILIR_SYM_STORE": "results/gravity3L_transforms_v2_p101.pkl"
   },
   "env_must_be_unset": {
     "_why": [
@@ -184,8 +185,8 @@
       "sha256": "cf885fad7d916df88483b6550ef4a3f7753e5c75b515a65466894770b1dce8d2"
     },
     "sym_store_p101": {
-      "path": "results/gr_transforms_p101.pkl",
-      "sha256": "86c30bce1ae5189052bcb87dd232dde0270720982b371f18eaf796a2fd4e6255"
+      "path": "results/gravity3L_transforms_v2_p101.pkl",
+      "sha256": "3155780b0deec03872a3503fae4d9fa057edf7d26f68933ddd095a8bcc750e85"
     }
   },
   "cli_required": {
