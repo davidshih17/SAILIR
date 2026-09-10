@@ -95,6 +95,15 @@ export SAILIR_ROUTE_BATCH=1
 # and defeating the purpose of routing. A timed-out integral becomes a survivor
 # and is reduced by an IBP worker instead -- lossless, just less optimised.
 export SAILIR_ROUTE_TIME_LIMIT=300
+# SYMMETRY MELDED INTO THE WORKER, replacing the bulk pre-routing pass.
+# greedy_worker._sym_first tries the route on its own target before loading
+# torch: success returns steps=0 method='symmetry' in seconds, failure falls
+# through to beam search at negligible cost. Same routing function as the bulk
+# pass, but paid ON DEMAND by jobs that were going to run anyway, instead of
+# speculatively over the whole frontier (~5,700 CPU-hours for one pass), and a
+# slow route stalls one worker rather than the orchestrator.
+export SAILIR_SYM_FIRST=1
+export SAILIR_ROUTE_BULK=0
 # Drip-feed: 104k jobs in one condor_submit jams the schedd (PITFALL 11).
 export SAILIR_ROUTE_SUBMIT_CHUNK=5000
 export SAILIR_ROUTE_QUEUE_CEILING=8000

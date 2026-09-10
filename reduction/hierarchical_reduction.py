@@ -1253,7 +1253,22 @@ def main():
                 #
                 # Condor per-integral jobs make the tail concurrent instead of
                 # blocking, and SAILIR_ROUTE_TIME_LIMIT bounds each one.
-                if _new_c:
+                # BULK PRE-ROUTING IS OFF BY DEFAULT. It speculatively routes
+                # the ENTIRE frontier, but only integrals that actually get
+                # dispatched ever needed a route -- measured, one pass over
+                # 104,383 candidates cost ~5,700 CPU-hours across six hours of
+                # wall clock, and produced 104k output files, for work most of
+                # which the campaign never consumed.
+                #
+                # SAILIR_SYM_FIRST=1 instead melds routing into the worker
+                # (greedy_worker._sym_first): a dispatched worker tries the route
+                # on its own target before loading torch, returns steps=0 with
+                # method='symmetry' if it succeeds, and otherwise falls through
+                # to beam search. Same routing function, same per-integral cost,
+                # but paid ON DEMAND and only by jobs that were going to run
+                # anyway -- and a slow route stalls one worker instead of the
+                # orchestrator's submission/collection loop.
+                if _new_c and os.environ.get('SAILIR_ROUTE_BULK', '0') == '1':
                     from routing_condor import route_batch_condor
                     print(f"[route] {len(_new_c)} candidates -> Condor "
                           f"(limit {_rt_limit}s/integral)", flush=True)

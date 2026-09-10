@@ -132,7 +132,17 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         from sailir import ibp_env as _ie
         _ie.init_from_topology(Topology.from_dir(topo))
         _ie.set_prime(prime)
-        _ie.set_paper_masters_only(True)
+        # Honour the CLI flag rather than hardcoding True. This is NOT
+        # load-bearing for the route itself -- routing is master-agnostic
+        # (symmetry_route/canonicalize2/routing_closure_worker contain no
+        # is_master or paper-masters reference; a rule I = sum c_J J depends
+        # only on the orbit and the total order) -- and the fall-through path
+        # re-initialises via set_paper_masters_only(args.paper_masters_only) in
+        # main(). But hardcoding True here contradicts the certified
+        # --no-paper-masters-only, and a later reader would reasonably assume it
+        # applies to the search.
+        _ie.set_paper_masters_only(peek('--no-paper-masters-only') is None
+                                   and '--no-paper-masters-only' not in sys.argv)
         if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
             from canonical_masters import apply_canonical_masters
             apply_canonical_masters()

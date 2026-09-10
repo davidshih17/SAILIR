@@ -113,6 +113,41 @@ def _build_rules(seeds, cap=20000):
     return rules
 
 
+# ---------------------------------------------------------------------------
+# DESCENT IS MODULO THE TERMINAL SET.
+#
+# A routing rule I = sum c_J J is a valid REDUCTION when every RHS term either
+# descends in the total order OR is terminal. Terminality is not a tkey
+# property: a master or corner needs no further reduction wherever it sits in
+# the ordering, so it can never close a worker/symmetry cycle. Testing
+# `all(tkey(k) > ki)` alone therefore REJECTS legitimate rules whose only
+# offending terms are masters or corners -- routing opportunities silently lost,
+# with the integral falling through to a worker that must redo the work.
+#
+# is_master() is the terminal set the workers actually use: the topology's
+# master basis UNION corner integrals in sectors the basis does not cover
+# (unless PAPER_MASTERS_ONLY). It requires ibp_env to be initialised; if it is
+# not, MASTERS_SET is empty and every term reads as non-terminal, which silently
+# reduces this to the old over-conservative test -- hence the loud warning.
+_TERMINAL_WARNED = False
+
+
+def _terminal(k):
+    """True if k is a master or corner, i.e. needs no further reduction."""
+    global _TERMINAL_WARNED
+    from sailir import ibp_env as _ie
+    if not _ie.MASTERS_SET and not _TERMINAL_WARNED:
+        _TERMINAL_WARNED = True
+        import sys as _sys
+        print("[symmetry_route] WARNING: MASTERS_SET is EMPTY -- ibp_env was "
+              "never initialised in this process, so no term can be recognised "
+              "as terminal and routing falls back to the over-conservative "
+              "tkey-only descent test. Call init_from_topology() (and "
+              "apply_canonical_masters() under SAILIR_SECTOR_RANK=1) first.",
+              file=_sys.stderr, flush=True)
+    return _ie.is_master(k)
+
+
 def symmetry_rule(I):
     """Symmetry rewrite for I that is strictly LOWER in the workers' ordering, or
     None if I is a survivor. Return value:
@@ -120,8 +155,10 @@ def symmetry_rule(I):
       {lower: coeff,...}  -> rewrite into terms strictly lower in the ordering (route free)
       None               -> survivor (dispatch an IBP worker)
     I is routed only when it is the highest-in-ordering member of its orbit closure
-    (so it is a pivot) and every RHS term is strictly lower in the ordering -- the
-    same descent direction as the IBP workers, so no worker/symmetry cycle forms.
+    (so it is a pivot) and every RHS term either is strictly lower in the ordering
+    -- the same descent direction as the IBP workers, so no worker/symmetry cycle
+    forms -- OR is TERMINAL (master/corner), which needs no further reduction and
+    so cannot close a cycle either.
     """
     I = tuple(I)
     rules = _build_rules({I})
@@ -129,7 +166,8 @@ def symmetry_rule(I):
         return None
     tail = rules[I]
     ki = tkey(I)
-    if all(tkey(k) > ki for k in tail):       # strictly LOWER in ordering (larger tkey); empty ok
+    # descend OR be terminal -- see _terminal() above
+    if all(tkey(k) > ki or _terminal(k) for k in tail):
         return tail
     return None
 
@@ -264,7 +302,7 @@ def canonical_monolithic_rule(I):
         # exists. Survivor -> the IBP worker reduces it directly. This is the
         # ONE sanctioned relaxation of the only-canonical-sectors guarantee.
         return None
-    assert all(tkey(k) > ki for k in img), (
+    assert all(tkey(k) > ki or _terminal(k) for k in img), (
         f"canonicalization fallback failed to descend for {list(I)} — "
         f"sector-senior order violated?")
     return img
@@ -291,7 +329,7 @@ def staged_rule(I):
             return None
         M, c = g
         img = image_unsigned(I, M, c)
-        if img is not None and all(tkey(k) > ki for k in img):
+        if img is not None and all(tkey(k) > ki or _terminal(k) for k in img):
             return img
         return None            # cannot happen under sector-senior order; safe fallback
     # step 2: within-sector reduction to the lowest-lex orbit representative
@@ -299,7 +337,7 @@ def staged_rule(I):
     if rules is None or I not in rules:
         return None
     tail = rules[I]
-    if all(tkey(k) > ki for k in tail):
+    if all(tkey(k) > ki or _terminal(k) for k in tail):
         return tail
     return None
 
