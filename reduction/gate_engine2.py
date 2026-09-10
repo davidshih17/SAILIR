@@ -123,9 +123,9 @@ def gate_pentagonbox():
     def secof(t):
         return sum(1 << i for i in range(N_DEN) if t[i] > 0)
 
-    def tkey(t):
-        return (-sum(x for x in t if x > 0), -sum(-x for x in t if x < 0),
-                tuple(abs(x) for x in t))
+    # BASE order (no sector-rank prefix): this picks orbit representatives, and
+    # the rank prefix is derived from exactly that choice -- see total_order.
+    from total_order import base_key as tkey
 
     edges = {}
     for m in range(1, 1 << N_DEN):

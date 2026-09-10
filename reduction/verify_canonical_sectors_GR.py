@@ -25,9 +25,10 @@ def sec(t):
     return sum(1 << i for i in range(N_DEN) if t[i] > 0)
 
 
-def tkey(t):
-    return (-sum(x for x in t if x > 0), -sum(-x for x in t if x < 0),
-            tuple(abs(x) for x in t))
+# The BASE order (no sector-rank prefix) -- these scripts BUILD the sector
+# ranking, so using the rank-prefixed tkey here would be circular. One
+# definition: reduction/total_order.py.
+from total_order import base_key as tkey  # noqa: E402
 
 
 # verified corner graph

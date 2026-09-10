@@ -42,10 +42,21 @@ def sector_mask(i):
     return m
 
 
+def base_key(i):
+    """The order WITHOUT the sector-rank prefix: (-r, -s, |abs|-tuple).
+
+    This is not merely "tkey with the flag off" -- it is what the scripts that
+    BUILD the sector ranking must use, since ranking sectors with a key that
+    depends on the sector ranking is circular. Kept here so those scripts import
+    it instead of hand-copying the tuple, which is how the copies drifted.
+    """
+    return (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
+            tuple(abs(x) for x in i))
+
+
 def tkey(i):
     """The workers' total order. Smaller = higher = eliminated first."""
-    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
-            tuple(abs(x) for x in i))
+    base = base_key(i)
     if not _SECTOR_RANK:
         return base
     return (-_RANK_IDX[sector_mask(i)],) + base
