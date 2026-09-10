@@ -1704,9 +1704,17 @@ def main():
                         if worker_mem_per_cpu > max_worker_memory_per_cpu_kb:
                             max_worker_memory_per_cpu_kb = worker_mem_per_cpu
 
-                        # Count new non-masters introduced
+                        # Count new non-masters introduced.
+                        # cached_count feeds ONLY the "Hits:" status counter, but
+                        # `set(cache.keys())` rebuilt a set of EVERY cache key --
+                        # 379,000 15-tuples -- once per collected result. Measured
+                        # at live scale: 71.9 ms per call, ~7,400 results per
+                        # iteration = 532s, i.e. most of the ~790s an iteration
+                        # spent collecting while the Condor queue sat empty.
+                        # Membership testing the ~18 new terms against the dict is
+                        # the same answer in O(18) instead of O(|cache|).
                         new_non_masters = get_non_masters(result_expr)
-                        cached_count = len(new_non_masters & set(cache.keys()))
+                        cached_count = sum(1 for k in new_non_masters if k in cache)
                         cache_hits += cached_count
 
                         # Propagate depth and parent to newly discovered children
