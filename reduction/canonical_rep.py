@@ -29,29 +29,10 @@ if _SECTOR_RANK:
     from sector_rank import RANK_IDX as _RANK_IDX
 
 
-def tkey(i):
-    """Workers' total order = beam_search_v7._target_key = (-r, -s, |abs|).
-    SMALLER key == higher in the ordering == eliminated first. The canonical rep to
-    pick is the MAXIMUM (the survivor), not the minimum.
-
-    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
-    SECTOR RANK first, then (r,s), then |abs|. This function still implements the
-    LEGACY order (no sector component) and must migrate JOINTLY with beam_search_v7,
-    symmetry_route, and the data-gen target selection at the symmetry-enhanced
-    retrain — never alone (confluence requires one shared order everywhere).
-    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix)."""
-    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
-            tuple(abs(x) for x in i))
-    if not _SECTOR_RANK:
-        return base
-    m = 0
-    for k in range(8):
-        if i[k] > 0:
-            m |= 1 << k
-    return (-_RANK_IDX[m],) + base
-
-
-_memo = {}
+# Total order: ONE definition, reduction/total_order.py. Re-implementing it
+# here is how canonical_rep drifted to a range(8) sector mask and disagreed
+# with the live order on 69% of gravity3L integrals.
+from total_order import tkey as tkey  # noqa: E402
 
 
 def clean_orbit(I, cap=4000):

@@ -24,9 +24,10 @@ _CACHE = os.path.join(ROOT, "reduction", "sailir_symmetry_transforms.pkl")
 def _weight(i):
     return (sum(max(0, x) for x in i), -sum(min(0, x) for x in i), tuple(abs(x) for x in i))
 
-def _target_key(i):
-    w = _weight(i)
-    return (-w[0], -w[1], w[2])
+# Total order: ONE definition, reduction/total_order.py. Re-implementing it
+# here is how canonical_rep drifted to a range(8) sector mask and disagreed
+# with the live order on 69% of gravity3L integrals.
+from total_order import tkey as _target_key  # noqa: E402
 
 
 def _eval_const(s, kin, prime):

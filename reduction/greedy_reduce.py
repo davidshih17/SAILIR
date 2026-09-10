@@ -436,12 +436,10 @@ _drop_memo = {}
 
 
 
-def _sector_mask(i):
-    m = 0
-    for k in range(_TC_N_DEN):
-        if i[k] > 0:
-            m |= 1 << k
-    return m
+# Total order: ONE definition, reduction/total_order.py. Re-implementing it
+# here is how canonical_rep drifted to a range(8) sector mask and disagreed
+# with the live order on 69% of gravity3L integrals.
+from total_order import sector_mask as _sector_mask  # noqa: E402
 
 
 def is_active(integral, start_w12):
@@ -512,25 +510,10 @@ _START_TOTAL_KEY = None   # set in main() = _target_key(start_int)
 # importing this module, so worker-driven runs get the strip on by default.
 
 
-def _target_key(i):
-    """Total-ordering key matching the training-data target selection:
-    (-r, -s, |abs|-tuple). Smaller = higher in the total ordering.
-
-    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
-    SECTOR RANK first, then (r,s), then |abs|. Default = LEGACY order;
-    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix). The flag
-    must be set identically for orchestrator + workers + symmetry_route +
-    canonical_rep of a run (the shared order keeps the substitution cache
-    acyclic)."""
-    # tkey's order is SMALLER = higher and DELIBERATELY deviates from
-    # weight() (which is larger = higher, with |abs| already negated).
-    # Compute it directly instead of deriving it from weight -- deriving it
-    # would need a per-component sign fix, the exact mismatch we removed.
-    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
-            tuple(abs(x) for x in i))
-    if not _SECTOR_RANK:
-        return base
-    return (-_RANK_IDX[_sector_mask(i)],) + base
+# Total order: ONE definition, reduction/total_order.py. Re-implementing it
+# here is how canonical_rep drifted to a range(8) sector mask and disagreed
+# with the live order on 69% of gravity3L integrals.
+from total_order import tkey as _target_key  # noqa: E402
 
 
 def _is_success(s, target_sector):

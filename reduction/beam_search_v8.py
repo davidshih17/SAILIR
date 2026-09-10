@@ -1,4 +1,14 @@
 #!/usr/bin/env python
+# =========================================================================
+# BEAM SEARCH V8 (2026-08-03): fork of beam_search_v7 with ONE change —
+# per-step TARGETING selects the SINGLE highest integral in the workers'
+# FULL total order (_target_key: sector rank when SAILIR_SECTOR_RANK=1,
+# then (r,s), then |abs| lex), exactly like the training-data generator
+# and the truth engine. v7 targeted ALL (r,s)-tied integrals per state
+# (no lex tiebreak) — the long-flagged train/inference target-ordering
+# mismatch ("Alignment is the next step"), measured 2026-08-02 to scatter
+# the beam across untrained sibling targets on dot-heavy sectors.
+# =========================================================================
 """v6 beam search: macro-beam architecture on top of v5 strip-passenger.
 
 Built from v5 (`beam_search_v5.py`). v5 wastes beam capacity because:
@@ -306,17 +316,15 @@ State_v5 = namedtuple(
     ['expr', 'resolved_subs',
      'score', 'path', 'n_non_masters',
      'max_w12', 'total_w12',  # cached sort keys, computed once at construction
-     'aux_flat',  # (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
-                  # or None to mean "rebuild from scratch on use"
-     'last_prob'],  # model prob of the action that CREATED this state, for
-                    # beam_sort='prob'. None on states not made by an action
-                    # (the root), which sort last.
+     'aux_flat',   # (cached_unique, union_bms, raw_id_to_idx, indirect_raws)
+                   # or None to mean "rebuild from scratch on use"
+     'lane'],      # DUAL beam only: which sub-beam this state belongs to.
+                   # 0 = weight-sorted lane, 1 = prob-sorted lane. Inherited by
+                   # children, so a lane's population descends only from itself
+                   # and the two searches never compete for the same slots.
+                   # Ignored (always 0) in every other beam_sort mode.
 )
-State_v5.__new__.__defaults__ = (None, None, None, None)  # max_w12, total_w12, aux_flat, last_prob
-
-# Weight of the n_non_masters regulariser in beam_sort='prob_nm'.
-# cost = _NM_LAMBDA * nm - log(prob). See sort_prob_nm for the scale argument.
-_NM_LAMBDA = float(os.environ.get('SAILIR_BEAM_NM_LAMBDA', '0.03'))
+State_v5.__new__.__defaults__ = (None, None, None, 0)  # max_w12, total_w12, aux_flat, lane
 
 
 # ============================================================================
@@ -356,6 +364,483 @@ if _SECTOR_RANK:
 # default pentagonbox = 8, the historical hardwired value). main() asserts it
 # matches the loaded topology.
 from topo_config import N_DEN as _TC_N_DEN
+
+# ---------------------------------------------------------------------------
+# MODEL-FREE ACTION SCORING (measurement only; default OFF = unchanged behavior)
+#
+# The model's dominant role in the search is a ~1000:1 filter: top_idx =
+# argsort(-row)[:K] keeps K=20 of ~9700 valid actions. Measured on the truth
+# recordings, sorting those same actions by sum|seed| puts a CERTIFIED-good
+# action at rank 0 half the time and inside the top 12 in 90% of steps -- so a
+# one-line sort may do most of that filtering job. This switch replaces the
+# per-action score with a model-free one so the claim can be tested end-to-end
+# in search rather than only offline.
+#
+# 'model'   (default) -- untouched, row stays exactly the model's probabilities
+# 'sumseed' -- score = -sum|seed|, seed = target + delta (the heuristic above)
+# 'random'  -- the FLOOR. If random top-K solves nearly as much, the search is
+#              easy and neither model nor heuristic is doing the work.
+#
+# Determinism: 'random' is seeded per (target, n_valid) with crc32, NOT Python's
+# hash() -- hash() is salted per process, which would make runs unreproducible
+# and silently break the bit-reproducibility the workers rely on.
+# ---------------------------------------------------------------------------
+# SAILIR_SCORE = local (default, unchanged) | cumulative.
+# 'cumulative' makes State.score the running sum of log-probs along the path
+# instead of only the last action's. See the note at the assignment site in
+# apply_action_v5 for why the usual "penalises long lineages" objection does
+# not apply (the beam advances in lockstep, so same-step states have equal
+# path lengths -- verified via restart_offsets empty in 100/100 runs).
+# ── TRUTH-TRACE ────────────────────────────────────────────────────────────
+# SAILIR_TRUTH_TRACE=<recording.jsonl> follows the truth reduction alongside the
+# search and records, step by step, whether the truth state is still inside the
+# beam -- and when it is not, WHY.
+#
+# The question this answers cannot be answered from the ordinary logs. A run
+# that ends up taking 3x the truth path length has left the truth trajectory
+# somewhere, but "nm went up" does not say whether the beam never generated the
+# right child or generated it and then culled it. Those need opposite fixes:
+#
+#   MODE A -- the truth state was in the beam, but the truth ACTION was not
+#             among the top-K expanded from it. The right move was never even a
+#             candidate. Fix: larger or adaptive K.
+#   MODE B -- the truth child WAS a candidate and lost the sort. Fix: the sort
+#             key, the lane split, or the beam width. The trace records its
+#             rank and how far it missed the cutoff by, so the size of the fix
+#             is measurable rather than guessed.
+#
+# Matching is by expression fingerprint: a beam state that has taken exactly
+# the truth actions has exactly the truth expression, so equality of
+# frozenset(expr.items()) at the same depth identifies it. Writing is
+# append-only JSON lines and touches nothing the search reads, so behaviour is
+# bit-identical with the variable unset -- and it is only worth paying for on a
+# diagnostic run, since fingerprinting every candidate costs a pass over the
+# candidate list.
+# ---- CLOSURE-LIBRARY TRACE (SAILIR_LIB_TRACE=<lib json>) -----------------
+# Asks, per step: are ANY beam states still inside the truth closure library?
+#
+# This replaces truth-PATH tracking, which was the wrong question twice over.
+# (1) It followed the single LEX row, one arbitrary tie-break among ~17.9
+#     equally-correct closure rows per step, so it punished the beam for
+#     holding a different, equally-reducing state. (2) It matched path
+#     prefixes, and a state is (expr, resolved_subs) -- prefix matching
+#     conflates distinct states and produced three retracted results.
+#
+# The library is a SET of (op, seed) actions -- the dependency closure of the
+# target rule -- and consuming it in ANY order succeeds (first/last/random
+# reach success in 338/352/352 steps). So membership is PATH-INDEPENDENT: a
+# state is inside iff every action on its path came from the set. No matching,
+# no tie-break, no conflation.
+_LIB_TRACE = os.environ.get('SAILIR_LIB_TRACE')
+_LIB = None
+if _LIB_TRACE:
+    with open(_LIB_TRACE) as _lf:
+        _LIB = {(int(r[0]), tuple(int(x) for x in r[1:]))
+                for r in __import__('json').load(_lf)['library']}
+
+
+_LIB_PARENT = []          # per-step: one entry per library-consistent parent
+# Every parent, tagged library or not, with AVAIL-FREE shape stats only:
+# top_prob and entropy. `conc = top_prob*avail` is undefined for a non-library
+# state (no correct set exists off the recorded reduction), so the comparable
+# quantities are the raw concentration measures.
+_ALL_PARENT = []
+
+
+def _in_library(st):
+    """Every action on this state's path drawn from the closure library.
+
+    path entries are (target, ibp_op, delta); the library stores (op, seed)
+    with seed = target + delta, so the two are compared in seed space.
+    """
+    for _t, _op, _d in st.path:
+        if (int(_op), tuple(int(a) + int(b) for a, b in zip(_t, _d))) not in _LIB:
+            return False
+    return True
+
+
+_TRUTH_TRACE = os.environ.get('SAILIR_TRUTH_TRACE')
+_TRACE_OUT = os.environ.get('SAILIR_TRACE_OUT', 'truth_trace.jsonl')
+_truth_fp = []      # per truth step: frozenset(expr.items())
+_truth_actions = []  # the truth walk's action sequence
+_frontier = -1      # furthest truth index the beam has ever held
+_trace_fh = None
+
+# SOL-FINGERPRINT TABU (SAILIR_SOL_TABU=1).
+# The existing tabu keys on (expression, target) and bans an (op, delta) pair
+# outright. But a state is (expr, resolved_subs): the SAME (op, delta) resolved
+# through a different substitution store yields a DIFFERENT substitution, so an
+# action tried by one lineage is not the same move for another that merely
+# shares the expression. Measured: at depth 3 of 2,1,0 this banned the truth
+# action outright -- 33 of 242 candidates blocked, the correct one among them,
+# and it never reached the model.
+#
+# The fix keys on what the action actually DID: the fingerprint of the resolved
+# substitution. That is the one object distinguishing two states sharing an
+# expression, it is computed anyway when the action is applied (free to record),
+# and it is a single integer -- no snapshot of the store, which grows
+# unboundedly along a lineage.
+#
+# Cost is bounded: the cheap (op, delta) key stays as a pre-filter, and the
+# substitution is re-derived ONLY for candidates it blocks (33 of 242 here),
+# never for the full list. A set, not a list, so it is bounded by the number of
+# genuinely distinct substitutions rather than by visit count.
+# LINEAGE-SCOPED TABU (SAILIR_LINEAGE_TABU=1).
+# Today a ban written under (expression, target) applies to EVERY later state
+# with that expression, whatever its lineage. Measured on 2,1,0 depth 3: the
+# entry that banned the truth action was written by a state at depth 1 that is
+# NOT an ancestor of the truth state (writers=1, ancestor_of_me=False). So the
+# ban blocked a state that had never tried the action, on behalf of a branch it
+# is not descended from -- which is not what tabu is for. Tabu exists to stop a
+# search re-treading ITS OWN steps.
+#
+# Scoping by ancestry keeps that purpose and drops the cross-lineage damage. To
+# avoid storing whole paths (they grow to thousands of entries), each writer is
+# recorded as (path_length, hash(path)); a ban applies to state P iff some
+# writer (L, H) has L <= len(P) and hash(P[:L]) == H -- i.e. the writer sits on
+# P's ancestry. Cost is paid only for actions the cheap key already blocked.
+# PROB FLOOR (SAILIR_PROB_FLOOR=x): drop actions the model rates below x
+# before they can enter the beam.
+#
+# Motivation, measured at 2,1,0 step 3 under the stock lexicographic key: of the
+# 113 candidates that outranked the truth child on max_w12 and took its beam
+# slot, only 18 were rated ABOVE it by the model -- the median sat at p ~ 1e-5.
+# The beam was spending 40 slots largely on moves the model considers
+# near-impossible, purely because their w2 was one lower. A floor removes those
+# without touching the sort, so no exchange rate has to be tuned and the
+# threshold is defined on the model's own scale rather than relative to a
+# candidate pool that shifts every time the sort changes.
+#
+# The top-1 action is always kept, so a state can never be left with nothing to
+# expand.
+# RESERVED PROB SLOTS (SAILIR_TOPN_PROB=n): give the model's n highest-scoring
+# candidates guaranteed places, then fill the rest of the beam by the ordinary
+# lex weight sort.
+#
+# Motivation: at 2,1,0 step 3 the truth child ranked 21st of 260 by model
+# probability -- and the dual beam's prob lane holds exactly 20. It missed a
+# guaranteed slot by one. Unlike an exchange rate between w2 and log p, this
+# needs no tuning against a candidate pool that shifts whenever the sort
+# changes: n is a slot count, and the model's ordering decides who fills it.
+_TOPN_PROB = int(os.environ.get('SAILIR_TOPN_PROB', '0') or 0)
+_PROB_FLOOR = float(os.environ.get('SAILIR_PROB_FLOOR', '0') or 0)
+_RANK_SCORE = os.environ.get('SAILIR_RANK_SCORE') == '1'
+# THE BEAM COMPARES LOG-PROBS ACROSS PARENTS, WHICH IS NOT A VALID COMPARISON.
+# Each parent's row is a softmax over ITS OWN action set -- different sizes
+# (70 to 2400 on one walk) and different difficulty -- so a parent where the
+# model is sharp wins every slot from a parent where it is diffuse, regardless
+# of correctness. Measured on 2,1,0 / soft_ep10 at the step the beam loses the
+# closure library: the BEST library candidate scored -2.245 (p=0.106) while
+# non-library candidates ran to -0.001 (p=0.999), and 40 of the latter cleared
+# the -2.531 cutoff. Meanwhile val_anyhit20 = 0.995-0.999, i.e. a correct
+# action is essentially ALWAYS in the parent's own top-20. Both are true: rank
+# WITHIN a parent is excellent, absolute probability ACROSS parents is not
+# comparable. The beam is a confidence magnet -- it fills with descendants of
+# parents the model happens to be sharp about, and sharpness tracks how easy
+# the state is, not whether the path is right.
+#
+# SAILIR_REL_SCORE=1 divides by the parent's own max, so the stored score
+# becomes log(p_i / p_max): rank-1 from EVERY parent is 0, and within-parent
+# gaps survive. Removes the cross-parent scale problem while keeping the
+# within-state judgement anyhit20 says the model is good at.
+_REL_SCORE = os.environ.get('SAILIR_REL_SCORE') == '1'
+_RESERVE_PARENT = os.environ.get('SAILIR_RESERVE_PARENT') == '1'
+# SAILIR_W1_FIRST=1 -- sort by w1 (the DOT COUNT) first, then by probability.
+# Splits the difference between `prob` and `weight`, using ONLY the component
+# that actually discriminates.
+#
+# MEASURED on soft_ep18, target 2,1,0, first 8 steps, 3339 candidates:
+#   w1 > start_w1 :  0 of 1382 LIBRARY candidates  (0.0%)
+#                  917 of 1957 NON-library         (46.9%)
+# A perfect one-way separator -- w1 above the start means the dot count has
+# INCREASED above the start integral, which cannot be on the reduction path.
+# Deprioritising them lifts the library fraction 0.414 -> 0.571 (1.38x) every
+# step, and r is what compounds.
+#
+# WHY NOT `weight` SORT: its key is (w1, w2, nm, -score). Measured, w2 and nm
+# do NOT separate the two classes at all -- nm quantiles are [1,5,8,11,18] for
+# library and [1,5,8,10,17] for non-library, identical. So `weight` pays for
+# one good key with two useless ones ahead of the model. This uses w1 alone.
+#
+# WHY A PREFERENCE AND NOT A FILTER: if the w1<=start pool ever empties the
+# beam can still fall back, where a hard drop would starve it.
+_W1_FIRST = os.environ.get('SAILIR_W1_FIRST') == '1'
+# SAILIR_W1_DROP=1 -- FILTER form of the same separator: discard candidates
+# whose w1 exceeds the START integral's w1, leaving `prob` as the PRIMARY sort.
+#
+# Distinct from W1_FIRST, which SORTS by w1 and thereby demotes probability to
+# a secondary key -- measured 20 (ep10) and 31 (ep18) against baselines 52 and
+# 60. Eleven variants in, the consistent pattern is that ANYTHING outranking
+# the model's probability loses, because that ranking supplies the whole ~1.5x
+# per-step enrichment holding r near 1. This drops provably-wrong candidates
+# WITHOUT touching the ordering of what remains.
+#
+# Sound because the separation is categorical, not distributional: 0 of 1382
+# library candidates had w1 > start_w1, against 917 of 1957 non-library.
+_W1_DROP = os.environ.get('SAILIR_W1_DROP') == '1'
+# SAILIR_ENT_BONUS=lam adds lam * H(parent) in log space, i.e. favours children
+# of HIGH-ENTROPY parents. Unlike REL_SCORE this can express "this parent is
+# suspiciously peaked" rather than merely normalising every parent alike --
+# worth separating because confidence is NOT always wrong (at step 50 the best
+# library candidate carried p~1.0 and was correct), so a flat anti-confidence
+# penalty would punish that too.
+_ENT_BONUS = float(os.environ.get('SAILIR_ENT_BONUS', '0') or 0)
+# SAILIR_ENT_CUT=x -- HARD cull: refuse to expand a parent whose action
+# distribution has entropy below x, i.e. drop OVERCONFIDENT states outright.
+# Different mechanism from ENT_BONUS (which re-scores); this removes them.
+# WARNING from the measured data: the library/non-library entropy ordering
+# FLIPS with depth (steps 0-6 LIB 2.701 vs NON 2.844; steps 45-52 LIB 2.653 vs
+# NON 2.089), so a fixed floor culls LIBRARY parents early and non-library ones
+# late. Net effect unknown -- measure, do not argue.
+# The top-scoring parent is always expanded regardless, so the beam can never
+# be emptied by the cut.
+_ENT_CUT = float(os.environ.get('SAILIR_ENT_CUT', '0') or 0)
+_LINEAGE_TABU = os.environ.get('SAILIR_LINEAGE_TABU') == '1'
+_BT_WHO = {}      # (expr_fp, target, action) -> set of (path_len, path_hash)
+
+_SOL_TABU = os.environ.get('SAILIR_SOL_TABU') == '1'
+_SOL_FP = {}      # (expr_fp, target, op, delta) -> set of substitution hashes
+_SOL_WHY = ['-', 0]   # diagnostic: why the truth action was kept/banned
+_SOL_WHO = {}         # same key -> list of writer paths
+
+_MW2_PRICE = float(os.environ.get('SAILIR_MW2_PRICE', '0') or 0)
+_SCORE_MODE = os.environ.get('SAILIR_SCORE', 'local')
+
+
+def _truth_trace_load():
+    """Read the truth walk's per-step expression fingerprints, once."""
+    global _truth_fp, _trace_fh
+    if not _TRUTH_TRACE:
+        return
+    import json as _json
+    with open(_TRUTH_TRACE) as fh:
+        for line in fh:
+            d = _json.loads(line)
+            op, dl = d['chosen_action']
+            _truth_actions.append(
+                (tuple(d['target']), int(op), tuple(dl)))
+    _trace_fh = open(_TRACE_OUT, 'w')
+    print(f'[truth-trace] loaded {len(_truth_actions)} truth actions from '
+          f'{_TRUTH_TRACE} -> {_TRACE_OUT}', flush=True)
+
+
+def _truth_enum_check(where, st, target, valid):
+    """Is the truth's NEXT action even in the beam's enumerated set?
+
+    Everything else is downstream of this. If the action the truth walk takes
+    from this exact state is not in `valid`, then no beam width, no K, no sort
+    key and no scoring window can ever follow the truth path -- the beam and the
+    recorder simply disagree about what is legal, and comparing them measures
+    nothing. Records, for a parent that is ON the truth path:
+      target_match  did the beam pick the same integral to eliminate?
+      in_valid      is the truth (op, delta) in the enumerated list?
+      idx / n       where, out of how many
+    """
+    if _trace_fh is None or not _truth_actions:
+        return
+    n = len(st.path)
+    if n >= len(_truth_actions):
+        return
+    if any(st.path[i] != _truth_actions[i] for i in range(n)):
+        return                      # this parent is not on the truth path
+    ta = _truth_actions[n]
+    import json as _j
+    tgt_ok = (tuple(target) == ta[0])
+    idx = -1
+    if tgt_ok:
+        try:
+            idx = list(valid).index((ta[1], ta[2]))
+        except ValueError:
+            idx = -1
+    _trace_fh.write(_j.dumps(dict(
+        event='ENUM', where=where, depth=n, target_match=bool(tgt_ok),
+        beam_target=list(target), truth_target=list(ta[0]),
+        in_valid=bool(idx >= 0), idx=idx, n_valid=len(valid))) + chr(10))
+    _trace_fh.flush()
+
+
+def _truth_trace_step(step, parents, candidates, beam, sort_w, sort_p,
+                      cand_meta=None):
+    """How long does the EXACT truth trajectory survive in the beam?
+
+    Matched on the ACTION PATH, not the expression. A beam state whose path
+    equals the truth walk's first j actions has by construction the identical
+    expression AND the identical substitution store, because both follow from
+    replaying the same actions from the same start. That makes the test exact.
+
+    Two earlier versions were unsound and their numbers are withdrawn:
+      * comparing expr against _truth_fp[step] assumed beam/truth lockstep;
+      * comparing expr against ALL truth indices produced false matches at a
+        high rate, because a state is (expr, subs) and truth state j carries j
+        substitution entries -- a 1-action beam state was being scored as
+        having "reached" a 19-action truth state on expression alone.
+    Recovery is not a meaningful notion under the exact test either: a lineage
+    that regains a truth EXPRESSION by another route has a different
+    substitution store and is a different state, so it is not the truth
+    trajectory. Survival is therefore monotone -- once no state carries the
+    truth prefix, the trajectory is lost for good.
+
+    Emits per step: the deepest truth prefix alive in the beam, how many states
+    carry it, whether the next truth action was generated as a candidate, and
+    whether that child survived selection.
+    """
+    global _frontier
+    if _trace_fh is None:
+        return
+    import json as _json
+    tp = _truth_actions
+    if not tp:
+        return
+
+    def _depth(st):
+        n = len(st.path)
+        if n <= len(tp) and all(st.path[i] == tp[i] for i in range(n)):
+            return n
+        return -1
+
+    depths = [_depth(st) for st in beam]
+    alive = [d for d in depths if d >= 0]
+    best = max(alive) if alive else -1
+    if best > _frontier:
+        _frontier = best
+    # Candidates and the post-selection beam sit at the SAME depth (both are
+    # this step's children), so counting candidates at _frontier+1 can never
+    # fire -- that was an off-by-one. Compare the deepest truth prefix among
+    # CANDIDATES against the deepest that SURVIVED: cand_depth > best means the
+    # truth child existed and was culled, which is the distinction that
+    # matters.
+    cd = [_depth(c) for c in candidates]
+    cand_alive = [d for d in cd if d >= 0]
+    cand_best = max(cand_alive) if cand_alive else -1
+    # When the truth child exists as a candidate but did NOT survive, record
+    # its actual keys against the worst survivor's. Every mu/lambda argument so
+    # far used numbers from the discredited expression matcher; these are the
+    # real ones.
+    _cmp = None
+    if cand_best > best:
+        _tc = next((c for c in candidates if _depth(c) == cand_best), None)
+        if _tc is not None and beam:
+            _worst = max(beam, key=lambda x: (x.max_w12, x.n_non_masters,
+                                              -x.score))
+            from collections import Counter as _Ctr
+            _mwd = _Ctr(tuple(c.max_w12[:2]) for c in candidates)
+            _better = sum(n for mw, n in _mwd.items()
+                          if mw < tuple(_tc.max_w12[:2]))
+            # score distribution INSIDE the mw pool that outranks the truth
+            # child: decides whether any (w1, w2, prob) weighting could lift it
+            # into the beam, or whether the better-mw pool is also well-rated.
+            _tmw = tuple(_tc.max_w12[:2])
+            _btr = sorted(c.score for c in candidates
+                          if tuple(c.max_w12[:2]) < _tmw)
+            import math as _m
+            _same = sorted((c.score for c in candidates
+                            if tuple(c.max_w12[:2]) == _tmw), reverse=True)
+            _same_rank = sum(1 for x in _same if x > _tc.score)
+            _cmp = dict(
+                same_mw_n=len(_same), same_mw_rank_by_prob=_same_rank,
+                same_mw_score_q=[round(_same[int(q*(len(_same)-1))], 2)
+                                 for q in (0, .25, .5, .75, 1)] if _same else [],
+                better_mw_n=len(_btr),
+                better_mw_p_above_truth=sum(1 for x in _btr
+                                            if x > _tc.score),
+                better_mw_score_q=[round(_btr[int(q*(len(_btr)-1))], 2)
+                                   for q in (0, .25, .5, .75, 1)] if _btr else [],
+                cand_mw_hist=sorted((list(k), v) for k, v in _mwd.items())[:6],
+                n_cand_better_mw=_better, n_cand=len(candidates),
+                truth_mw=list(_tc.max_w12), truth_nm=int(_tc.n_non_masters),
+                truth_score=float(_tc.score),
+                cut_mw=list(_worst.max_w12), cut_nm=int(_worst.n_non_masters),
+                cut_score=float(_worst.score))
+    if _LIB is not None:
+        _bl = [b for b in beam if _in_library(b)]
+        _cl = [c for c in candidates if _in_library(c)]
+        # WHY THE CULL PREFERS NON-LIBRARY STATES. Compare the two candidate
+        # populations on the exact quantities the sort keys read: score (log
+        # prob), max_w12 and n_non_masters. If library candidates are plentiful
+        # (they are: 65-99 of ~600 right up to the death) but lose slots, the
+        # answer is in the gap between these distributions.
+        def _q(v):
+            v = sorted(v)
+            return [round(v[int(f * (len(v) - 1))], 3)
+                    for f in (0, .25, .5, .75, 1)] if v else []
+        _nl = [c for c in candidates if not _in_library(c)]
+        _rec2 = dict(step=step, n_beam=len(beam), n_lib_beam=len(_bl),
+                     n_cand=len(candidates), n_lib_cand=len(_cl),
+                     lib_depth=max((len(b.path) for b in _bl), default=-1),
+                     best_lib_nm=min((b.n_non_masters for b in _bl),
+                                     default=-1),
+                     best_lib_mw=(list(min(_bl, key=lambda b: b.max_w12).max_w12)
+                                  if _bl else None),
+                     beam_best_nm=min((b.n_non_masters for b in beam),
+                                      default=-1),
+                     lib_score_q=_q([c.score for c in _cl]),
+                     non_score_q=_q([c.score for c in _nl]),
+                     lib_nm_q=_q([float(c.n_non_masters) for c in _cl]),
+                     non_nm_q=_q([float(c.n_non_masters) for c in _nl]),
+                     lib_mw_hist=sorted(
+                         (list(k), v) for k, v in
+                         __import__('collections').Counter(
+                             tuple(c.max_w12) for c in _cl).items())[:5],
+                     non_mw_hist=sorted(
+                         (list(k), v) for k, v in
+                         __import__('collections').Counter(
+                             tuple(c.max_w12) for c in _nl).items())[:5],
+                     # where the surviving beam's worst member sits -- the bar
+                     # every library candidate had to clear
+                     cut_score=(min(b.score for b in beam) if beam else None),
+                     cut_nm=(max(b.n_non_masters for b in beam) if beam else None),
+                     lib_parents=list(_LIB_PARENT),
+                     all_parents=list(_ALL_PARENT))
+        del _LIB_PARENT[:]
+        del _ALL_PARENT[:]
+        _trace_fh.write(_json.dumps(_rec2) + chr(10))
+        _trace_fh.flush()
+    rec = dict(step=step, truth_depth=best, n_on_truth=len(alive),
+               cand_depth=cand_best, n_cand_on_truth=len(cand_alive),
+               culled=bool(cand_best > best), cmp=_cmp,
+               deepest_ever=_frontier,
+               n_cand=len(candidates), n_beam=len(beam))
+    _trace_fh.write(_json.dumps(rec) + chr(10))
+    _trace_fh.flush()
+
+if _SCORE_MODE not in ('local', 'cumulative', 'decay'):
+    raise SystemExit(f"unknown SAILIR_SCORE={_SCORE_MODE!r} "
+                     f"(local | cumulative | decay)")
+# 'decay' = cumulative WITH FORGETTING:  score_t = gamma*score_{t-1} + log p_t
+# A geometric window instead of a hard one -- no per-state deque, still one
+# float. gamma=0 reproduces 'local' exactly and gamma=1 reproduces
+# 'cumulative', so the three modes are one continuous knob.
+#
+# Why forgetting may beat both endpoints:
+#   * cumulative never revises stale evidence -- a lineage is judged forever on
+#     a step-30 probability that described a state 800 steps ago;
+#   * cumulative also COMPRESSES: by step 800 every survivor sums to ~-800 and
+#     the differences that decide the ranking shrink toward the tiebreakers;
+#   * local keeps full scale but has one-step memory, so 800 good decisions
+#     count for nothing.
+# The decayed sum is bounded (geometric), so it keeps the model's signal on a
+# fixed scale against the nm penalty for the whole run.
+_SCORE_DECAY = float(os.environ.get('SAILIR_SCORE_DECAY', '0.9'))
+if not 0.0 <= _SCORE_DECAY <= 1.0:
+    raise SystemExit(f"SAILIR_SCORE_DECAY must be in [0,1], got {_SCORE_DECAY}")
+
+_ACTION_SCORE = os.environ.get('SAILIR_ACTION_SCORE', 'model')
+if _ACTION_SCORE not in ('model', 'sumseed', 'random'):
+    raise SystemExit(f"unknown SAILIR_ACTION_SCORE={_ACTION_SCORE!r} "
+                     f"(model | sumseed | random)")
+
+
+def _model_free_row(target, valid, n_v):
+    """Per-action scores with the model removed. Higher is better, matching
+    the model's probabilities, so every downstream consumer (top-K, tabu,
+    sort_prob) works unchanged."""
+    if _ACTION_SCORE == 'sumseed':
+        return np.array(
+            [-float(sum(abs(t + d) for t, d in zip(target, valid[i][1])))
+             for i in range(n_v)], dtype=np.float64)
+    import zlib
+    seed = zlib.crc32(repr((tuple(target), n_v)).encode()) & 0xffffffff
+    return np.random.default_rng(seed).random(n_v)
 
 # ============================================================================
 # SAILIR_SYM_DROP -- DO NOT ENABLE IN PRODUCTION. VERDICT LOCKED 2026-07-11.
@@ -450,6 +935,27 @@ def is_active(integral, start_w12):
     w = weight(integral)
     if (w[0], w[1]) < start_w12:
         return False
+    if _STRIP_TOTAL and _START_TOTAL_KEY is not None:
+        # Strictly BELOW the start in the total ordering => passenger.
+        # Built from the w we already have instead of calling _target_key(),
+        # which would recompute weight() (and _sector_mask()) on every term of
+        # every state. When the sector test above ran, every surviving integral
+        # shares the start's rank prefix, so comparing the (r,s,|abs|) tail is
+        # equivalent to comparing the full key.
+        # tkey-order tail, computed directly (weight() deviates)
+        # tkey order (smaller = higher) computed DIRECTLY from the
+        # indices -- never by re-signing weight()'s components.
+        tail = (-sum(x for x in integral if x > 0),
+                -sum(-x for x in integral if x < 0),
+                tuple(abs(x) for x in integral))
+        if not _SECTOR_RANK:
+            if tail > _START_TOTAL_KEY:
+                return False
+        elif _START_SECTOR is not None:
+            if tail > _START_TOTAL_KEY[1:]:
+                return False
+        elif _target_key(integral) > _START_TOTAL_KEY:
+            return False
     if _SYM_DROP and _drop_wt is not None and (w[0], w[1]) == _START_RS \
             and integral != _START_INT and _has_drop_witness(integral):
         return False
@@ -472,6 +978,32 @@ def strip_passenger(d, start_w12):
 # is even shorter (strictly <= the steps of the default criterion).
 _SUCCESS_TOTAL = os.environ.get('SAILIR_SUCCESS_TOTAL', '0') == '1'
 _START_TOTAL_KEY = None   # set in main() = _target_key(start_int)
+
+# --- TOTAL-ORDER PASSENGER STRIP -------------------------------------------
+# The strip decides what stays in the expression. It used to keep everything at
+# (w1,w2) >= the start's, which retains integrals at the SAME (r,s) but larger
+# |abs| -- those are strictly BELOW the start in the total ordering, so under
+# the total-order success criterion they are passengers: they can never be
+# targeted (targets are min(nm, key=_target_key), and anything below the start
+# loses to the start itself) and they cannot affect whether the step succeeds.
+# Carrying them costs memory and model attention for nothing. The truth
+# recorder already strips exactly this way (_active: same sector and
+# tkey(k) <= tkey(T)), so turning it on also removes a train/inference mismatch.
+#
+# DEFAULT FOLLOWS _SUCCESS_TOTAL, and the mixed setting is refused, because
+# stripping by total order while success is still the (w1,w2) bucket test would
+# declare success EARLY: the same-(r,s)-larger-|abs| terms would be dropped from
+# the expression rather than eliminated, so n_non_masters could reach 0 with
+# real work outstanding. Both workers force SAILIR_SUCCESS_TOTAL=1 before
+# importing this module, so worker-driven runs get the strip on by default.
+_STRIP_TOTAL = os.environ.get(
+    'SAILIR_STRIP_TOTAL', '1' if _SUCCESS_TOTAL else '0') == '1'
+if _STRIP_TOTAL and not _SUCCESS_TOTAL:
+    raise SystemExit(
+        'SAILIR_STRIP_TOTAL=1 requires SAILIR_SUCCESS_TOTAL=1: stripping by '
+        'the total order while success is the (w1,w2) bucket test would '
+        'declare success before the same-(r,s)/larger-|abs| terms are '
+        'eliminated.')
 
 
 # Total order: ONE definition, reduction/total_order.py. Re-implementing it
@@ -629,6 +1161,17 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
     sol = solve_ibp_for(cached, target)
     if sol is None:
         return None
+    if _SOL_TABU:
+        # free: sol is computed here anyway to apply the action
+        _SOL_FP.setdefault(
+            (frozenset(state.expr.items()), tuple(target), ibp_op,
+             tuple(delta)), set()).add(hash(frozenset(sol.items())))
+        # who wrote it: the writing state's path. Lets us ask whether a ban
+        # came from this lineage's own ancestor (a genuine loop) or from an
+        # unrelated lineage that merely passed through the same expression.
+        _SOL_WHO.setdefault(
+            (frozenset(state.expr.items()), tuple(target), ibp_op,
+             tuple(delta)), []).append(tuple(state.path))
     new_expr = apply_substitution_v5(
         state.expr, target, sol, target_sector, start_w12,
     )
@@ -641,7 +1184,31 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
         )
 
     new_path = state.path + [(target, ibp_op, delta)]
-    new_score = state.score + math.log(action_prob + 1e-10)
+    # score = LOCAL log-prob of the action just taken, or CUMULATIVE path
+    # log-prob with SAILIR_SCORE=cumulative.
+    #
+    # The original justification for local-only was that cumulative scoring
+    # "biases against long lineages". That does not apply here: the beam
+    # advances in lockstep, so EVERY state in the beam at step k has taken
+    # exactly k actions -- verified, 0/100 runs had non-empty restart_offsets,
+    # so paths are unbroken chains. Comparing cumulative scores within a step
+    # compares sums of equally many terms, and length-normalising would divide
+    # every candidate by the same k, leaving the order unchanged.
+    #
+    # What local scoring actually does is give the ranking ONE-STEP MEMORY: at
+    # step 4,881 the 4,880 preceding decisions count for nothing, and a state
+    # reached by a poor route outranks a well-reached one whenever its last
+    # move happened to look easy. The remaining honest argument for local is
+    # that cumulative scoring holds one early improbable step against a lineage
+    # forever -- which is either a bug or correct bookkeeping depending on
+    # whether the model's early probabilities mean anything.
+    _lp = math.log(action_prob + 1e-10)
+    if _SCORE_MODE == 'cumulative':
+        new_score = state.score + _lp
+    elif _SCORE_MODE == 'decay':
+        new_score = _SCORE_DECAY * state.score + _lp
+    else:
+        new_score = _lp
     nm = get_non_masters(new_expr, target_sector)
     mw, tw = _mw_tw_from_nm(nm)   # beam-ranking weights (total ordering if SAILIR_BEAM_TOTAL)
     child = State_v5(
@@ -653,7 +1220,7 @@ def apply_action_v5(state, target, ibp_op, delta, action_prob,
         max_w12=mw,
         total_w12=tw,
         aux_flat=None,
-        last_prob=action_prob,
+        lane=state.lane,      # DUAL: a child stays in its parent's sub-beam
     )
     return child, sol
 
@@ -871,9 +1438,13 @@ def total_w12(expr, target_sector):
 # with directs kept. Default stays first900 (bit-identical); set maxweight via env
 # for the pathological/compute-dominating integrals. The metric compute itself is
 # free (74: identical 4.3s/step); cost differences are which states the path
-# visits. NOTE: known train/inference target-ordering mismatch — training data
-# (generate_multisector_data.py) targets ONE integral by full (r,s,lex) order;
-# this beam search targets ALL (r,s)-tied integrals. Alignment is the next step.
+# visits.
+# (An older NOTE here claimed a train/inference target-ordering mismatch -- that
+# the beam targeted ALL (r,s)-tied integrals while training data targets ONE by
+# full order. STALE, removed 2026-08-23: every target site is
+# `tied = [min(nm, key=_target_key)]` (4 sites, each marked "v8: SINGLE
+# full-order target"), and _target_key IS the training-data order (-r, -s,
+# |abs|). The `tied` name is a leftover from the old behaviour.)
 _ACTION_SELECT = os.environ.get('SAILIR_ACTION_SELECT', 'first900')
 _METRIC_STRATEGIES = ('maxweight', 'shortest', 'sumweight')
 # per-id metric arrays, cached + grown like packed_cu._bm_array (bounded memory)
@@ -1066,7 +1637,10 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             max_w12=init_mw,
             total_w12=init_tw,
         )
-        beam = [initial]
+        # DUAL: seed BOTH lanes with the start state, so each sub-beam has its
+        # own root and neither can be starved of ancestry by the other.
+        beam = ([initial, initial._replace(lane=1)]
+                if beam_sort == 'dual' else [initial])
     best_state = beam[0]
     initial_mw = max_w12(start_expr, target_sector)
     t0 = time.time()
@@ -1092,40 +1666,99 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     if resume_from is not None and os.path.exists(resume_from):
         del d
 
+    # SOFT w2 (2026-08-15). sort_weight is lexicographic on
+    # (max_w12, n_non_masters, -score), so max_w12 is absolute and the model is
+    # only a third-level tiebreak. That makes the weight lane structurally
+    # unable to follow a truth path that goes temporarily UPHILL -- and the
+    # truth-trace showed exactly that: at the step where the beam lost the truth
+    # trajectory the correct child had max_w12 [11,2] against a cutoff of
+    # [11,1], i.e. w1 tied and w2 worse by one, while being 0.97 nats BETTER on
+    # the model and equal on n_non_masters. It was rejected on key #1 alone.
+    #
+    # SAILIR_MW2_PRICE=mu makes only w2 tradeable, at a price of mu nats per
+    # unit:
+    #     (w1,  mu*w2 + lambda*nm - score)
+    # w1 keeps absolute priority, so the dot-count can still never worsen and
+    # the search cannot ratchet along the dangerous axis. Every uphill move the
+    # truth path was observed taking was in w2.
+    #
+    # A scalar collapse like w1+w2 would NOT do: (12,0) and (11,1) both sum to
+    # 12 while lexicographically (11,1) < (12,0). The two axes are not
+    # commensurate and must not be added.
+    #
+    # From the measured step: the truth child survives iff mu*2 + 3.35 <
+    # mu*1 + 4.32, i.e. mu < 0.97.
+    # Default 0 = disabled = bit-identical to the previous behaviour.
+    def _norm_score(s):
+        # match sort_prob's normalisation so mu means the same thing at any
+        # SAILIR_SCORE setting (identical to s.score under the default 'local')
+        if _SCORE_MODE == 'cumulative':
+            return s.score / max(len(s.path), 1)
+        if _SCORE_MODE == 'decay':
+            return ((1.0 - _SCORE_DECAY) * s.score if _SCORE_DECAY < 1.0
+                    else s.score / max(len(s.path), 1))
+        return s.score
+
     def sort_weight(s):
+        if _MW2_PRICE > 0.0:
+            # w2 - mu*score, with NO nm term. Order-equivalent to the earlier
+            # mu*w2 - score under mu -> 1/mu, so this is a reparametrisation
+            # rather than a new rule -- kept because it makes mu read directly
+            # as "nats of model log-prob per unit of w2".
+            # SINGLE-KEY BEAM: (w1, mu*w2 + lambda*nm - score).
+            # Measured at the step where the truth trajectory is lost
+            # (2,1,0 depth 3), truth child vs the binding cutoff:
+            #     truth  w1=11 w2=2 nm=5   score=-2.77
+            #     cutoff w1=11 w2=1 nm=15  score=-1.77
+            # The truth child is WORSE on w2 (+1) and on score (+1.0 nat) but
+            # far better on nm (5 vs 15). With no nm term it therefore loses at
+            # every mu >= 0 -- verified at mu = 0.01, 0.05, 1, 5. Restoring nm:
+            #     truth wins iff  lambda*(15-5) > mu + 1.0,  i.e. lambda > (mu+1)/10
+            # so lambda ~ 0.15-0.3 at small mu, just above the 0.1 the beam has
+            # been running.
+            return (s.max_w12[0],
+                    _MW2_PRICE * s.max_w12[1]
+                    + _nm_penalty * s.n_non_masters - _norm_score(s))
         return (s.max_w12, s.n_non_masters, -s.score)
 
     def sort_totalweight(s):
         return (s.total_w12, s.n_non_masters, -s.score)
 
-    def sort_prob_nm(s):
-        # 'prob_nm': the model's current-step probability GUIDES, with an
-        # n_non_masters REGULARISER -- a single cost, not a lexicographic key:
-        #
-        #     cost = lambda * nm  -  log(prob)          (lower is better)
-        #
-        # Still no accumulated path score and no max_w12, so this isolates the
-        # effect of the nm term alone against plain 'prob'.
-        #
-        # SCALE, measured on the bce/sigmoid checkpoint over 200 states: the top
-        # action of every state scores ~0.9999 (whole range 0.967-1.000), so
-        # -log(prob) spans only ~0.033, while nm spans 1..18. Any lambda much
-        # above ~0.002 therefore makes nm strictly dominant and the sort
-        # degenerates to lexicographic-by-nm. The default below is chosen so one
-        # extra non-master costs about as much as the FULL observed spread of
-        # top-action confidence -- i.e. an exceptionally confident action can
-        # just offset one extra non-master, and no more. Tune with
-        # SAILIR_BEAM_NM_LAMBDA.
-        p = s.last_prob if s.last_prob is not None else 1e-12
-        return _NM_LAMBDA * s.n_non_masters - math.log(max(p, 1e-12))
+    # Drain pressure for prob-sort (2026-08-03): pure local log-prob has no
+    # incentive to shrink the active bucket, so on long runs the beam wanders
+    # and nm ratchets into the hundreds (frozen-7 divergence). Penalize each
+    # active non-master by SAILIR_NM_PENALTY in log-prob units so states that
+    # grow the bucket must buy it with genuinely better-ranked actions.
+    _nm_penalty = float(os.environ.get('SAILIR_NM_PENALTY', '0.0'))
 
     def sort_prob(s):
-        # beam_sort='prob': rank ONLY by the model's probability for the action
-        # that produced this state. Deliberately drops both of the other terms
-        # in sort_weight: no max_w12/n_non_masters progress regulariser, and no
-        # accumulated path score -- so nothing carries over between steps and
-        # the frontier is whatever looks most confident right now.
-        return (-(s.last_prob if s.last_prob is not None else -1.0),)
+        # model-credited selection (2026-08-02): action log-prob first
+        # (minus the nm drain penalty) — lets a confident learned route
+        # survive weight-uphill stretches that sort_weight prunes
+        # structurally. Weight as tiebreak.
+        #
+        # Under SAILIR_SCORE=cumulative the score is a running SUM, which grows
+        # to ~-4000 by step 4000 while the nm penalty stays ~-2 -- the penalty
+        # would silently become 0.05% of the ranking and stop working. Dividing
+        # by the path length restores its relative weight. It does NOT change
+        # the score ordering: the beam advances in lockstep, so every state
+        # being compared has the same path length and is divided by the same k.
+        if _SCORE_MODE == 'cumulative':
+            _sc = s.score / max(len(s.path), 1)
+        elif _SCORE_MODE == 'decay':
+            # (1-gamma) turns the geometric sum into a WEIGHTED MEAN of recent
+            # log-probs, so the scale matches 'local' (and gamma=0 is exactly
+            # local) and the nm penalty keeps its relative weight at any gamma.
+            _sc = (1.0 - _SCORE_DECAY) * s.score if _SCORE_DECAY < 1.0 \
+                else s.score / max(len(s.path), 1)
+        else:
+            _sc = s.score
+        if _W1_FIRST:
+            return (s.max_w12[0],
+                    -(_sc - _nm_penalty * s.n_non_masters),
+                    s.max_w12[1], s.n_non_masters)
+        return (-(_sc - _nm_penalty * s.n_non_masters),
+                s.max_w12, s.n_non_masters)
 
     # Hoist memprobe config out of the per-step loop. Per-step we want at
     # most a set-membership check or an integer modulo — no env-var parsing.
@@ -1445,6 +2078,14 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
     # step to <dir>/picks_step<N>.pkl. Used to diff baseline-tabu vs rank-cycle
     # picks and locate the first divergence. Off unless SAILIR_PICK_DUMP set.
     _pick_dump_dir = os.environ.get('SAILIR_PICK_DUMP')
+    # v8 diagnostics: PRE-CAP action-space accounting. _PRECAP_STATS per step:
+    # [n_tasks, total_precap, max_precap, n_capped_tasks]. SAILIR_PRECAP_DUMP
+    # additionally dumps each task's FULL pre-cap list per step.
+    _precap_dump_dir = os.environ.get('SAILIR_PRECAP_DUMP')
+    if _precap_dump_dir:
+        os.makedirs(_precap_dump_dir, exist_ok=True)
+    _PRECAP_STATS = [0, 0, 0, 0]
+    _PRECAP_BUF = []
 
     # Optional tabu audit / sol fallback infra.
     # SAILIR_TABU_AUDIT=1       → maintain _sol_history + dump audit on stuck
@@ -1478,8 +2119,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             if _is_success(s, target_sector):   # single-step: active bucket drained
                 continue
             nm = get_non_masters(s.expr, target_sector)
-            mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-            tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+            tied = [min(nm, key=_target_key)]  # v8: SINGLE full-order target
             dummy_subs = {k: {} for k in s.resolved_subs.keys()}
             if s.aux_flat is not None:
                 indirect_cache = _aux_to_result(s.aux_flat, env)
@@ -1511,13 +2151,36 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     env.ibp_t, env.li_t, env.shifts, 'subsector',
                     env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                 )
+                if _trace_fh is not None:
+                    _truth_enum_check('A', s, target, valid)
                 if (not _bounded_tabu_on
                         and tabu_dict is not None and valid):
                     expr_fp = frozenset(s.expr.items())
                     tabu_set = tabu_dict.get(expr_fp)
                     if tabu_set:
+                        _pre_tabu = list(valid)
                         valid = [(op, dlt) for (op, dlt) in valid
                                  if (target, op, dlt) not in tabu_set]
+                        # Did tabu just ban the truth action? The tabu key is
+                        # the EXPRESSION, but a state is (expr, subs) -- so an
+                        # action tried by a different state that merely shares
+                        # this expression can ban it here.
+                        if _trace_fh is not None and _truth_actions:
+                            _tn = len(s.path)
+                            if (_tn < len(_truth_actions) and
+                                all(s.path[_i] == _truth_actions[_i]
+                                    for _i in range(_tn))):
+                                _tta = _truth_actions[_tn]
+                                if (tuple(target) == _tta[0]
+                                        and (_tta[1], _tta[2]) in _pre_tabu
+                                        and (_tta[1], _tta[2]) not in valid):
+                                    import json as _j
+                                    _trace_fh.write(_j.dumps(dict(
+                                        event='TABU_BANNED_TRUTH', depth=_tn,
+                                        n_before=len(_pre_tabu),
+                                        n_after=len(valid),
+                                        tabu_size=len(tabu_set))) + chr(10))
+                                    _trace_fh.flush()
                 elif _bounded_tabu_on and valid:
                     _bt_key = (frozenset(s.expr.items()), target)
                     _bt_set = _bt_tabu.get(_bt_key)
@@ -1615,7 +2278,10 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         all_tasks.sort(key=lambda t: t[0])  # stable -> per-parent target order kept
         return all_tasks, aux_updates
 
+    if _TRUTH_TRACE and _trace_fh is None:
+        _truth_trace_load()
     for step in range(resume_step, max_steps):
+        _trace_parents = list(beam) if _trace_fh is not None else ()
         # Termination: ANY beam state has drained — we only need one successful
         # path (the proof). Don't wait for every beam slot to finish.
         winning = next((s for s in beam if _is_success(s, target_sector)), None)
@@ -1644,15 +2310,41 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
         # Keep best variant per expr_fp by progress key (low max_w12, low nm,
         # high score).
         _dedup_t = time.time()
-        macro_groups = {}  # expr_fp → best State
+        # DUAL: key by (expr_fp, lane), not expr_fp alone. Both lanes start
+        # from the SAME expression, so a plain expr_fp key would keep one
+        # representative, expand only that lane, and the other lane -- whose
+        # children inherit the parent's lane -- would receive no candidates at
+        # all and vanish on the first step.
+        macro_groups = {}  # expr_fp (or (expr_fp, lane)) → best State
         for s in beam:
             efp = frozenset(s.expr.items())
+            if beam_sort == 'dual':
+                efp = (efp, s.lane)
             cur = macro_groups.get(efp)
             if cur is None or (s.max_w12, s.n_non_masters, -s.score) < \
                               (cur.max_w12, cur.n_non_masters, -cur.score):
                 macro_groups[efp] = s
         n_orig_beam = len(beam)
+        _pre_dedup = beam
         beam = list(macro_groups.values())
+        # DEDUP CHECK: macro-dedup keys on the EXPRESSION alone, but a state is
+        # (expr, subs). Two states with the same expression and different
+        # substitution stores are not duplicates, yet one is discarded. Record
+        # whether the truth-path state went in and did not come out.
+        if _trace_fh is not None and _truth_actions:
+            def _d(st):
+                n = len(st.path)
+                return n if (n <= len(_truth_actions) and
+                             all(st.path[i] == _truth_actions[i]
+                                 for i in range(n))) else -1
+            _pre = max((_d(x) for x in _pre_dedup), default=-1)
+            _post = max((_d(x) for x in beam), default=-1)
+            if _pre >= 0 and _post < 0:
+                import json as _j
+                _trace_fh.write(_j.dumps(dict(
+                    step=step, event='DEDUP_KILLED_TRUTH', depth=_pre,
+                    n_before=n_orig_beam, n_after=len(beam))) + chr(10))
+                _trace_fh.flush()
         n_macros = len(beam)
         # Trace this collapse — it's the v6 telemetry the user cares about.
         if verbose and n_macros < n_orig_beam:
@@ -1701,8 +2393,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     continue
                 _t = time.time() if _v5_prof else 0
                 nm = get_non_masters(s.expr, target_sector)
-                mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                tied = [min(nm, key=_target_key)]  # v8: SINGLE full-order target
                 if _v5_prof:
                     _p1['nm_tied'] += time.time() - _t
                 # Dummy subs (RS keys with empty values) — only used as keys for
@@ -1757,6 +2448,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         env.ibp_t, env.li_t, env.shifts, 'subsector',
                         env._raw_eq_cache, _V7_REGISTRY, ibp_env.N_INDICES,
                     )
+                    if _trace_fh is not None:
+                        _truth_enum_check('B', s, target, valid)
                     if _v5_prof:
                         _p1['gv'] += time.time() - _t
                         _ct['enum_calls'] += 1
@@ -1789,10 +2482,149 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         if _bt_set:
                             _nblk = sum(1 for a in valid if a in _bt_set)
                             if _nblk < len(valid) and _nblk <= _tabu_cap_eff:
-                                valid = [a for a in valid if a not in _bt_set]
+                                _pre_bt = list(valid)
+                                if _SOL_TABU:
+                                    # Re-derive the substitution for the BLOCKED
+                                    # minority only, using exactly the path
+                                    # apply_action_v5 uses -- aux cache when the
+                                    # action is indirect, raw equation + this
+                                    # state's store when it is DIRECT. The
+                                    # aux-only version kept the ban on every
+                                    # direct action, which is precisely the case
+                                    # this exists to rescue.
+                                    _N = ibp_env.N_INDICES
+                                    _efp = frozenset(s.expr.items())
+                                    _keep = []
+                                    for _a in valid:
+                                        if _a not in _bt_set:
+                                            _keep.append(_a); continue
+                                        _op, _dl = _a
+                                        _sd = tuple(target[_i] + _dl[_i]
+                                                    for _i in range(_N))
+                                        _cch = None
+                                        if s.aux_flat is not None:
+                                            _ix = s.aux_flat[2].get((_op, _sd))
+                                            if _ix is not None:
+                                                _cch = _v7_as_dict(
+                                                    s.aux_flat[0][_ix])
+                                        if _cch is None:
+                                            _rw = env.get_raw_equation_cached(
+                                                _op, _sd)
+                                            _cch = (
+                                                apply_resolved_subs_dict_x_packed(
+                                                    _rw, s.resolved_subs,
+                                                    _V7_REGISTRY, ibp_env.PRIME)
+                                                if _PACKED_RS else
+                                                apply_resolved_subs(
+                                                    _rw, s.resolved_subs))
+                                        _isT = (_truth_actions and
+                                                len(s.path) < len(_truth_actions)
+                                                and all(s.path[_q] ==
+                                                        _truth_actions[_q]
+                                                        for _q in range(len(s.path)))
+                                                and (tuple(target),) ==
+                                                (_truth_actions[len(s.path)][0],)
+                                                and _op ==
+                                                _truth_actions[len(s.path)][1]
+                                                and tuple(_dl) ==
+                                                _truth_actions[len(s.path)][2])
+                                        if (target not in _cch
+                                                or _cch[target] == 0):
+                                            if _isT: _SOL_WHY[0] = 'no_target'
+                                            continue
+                                        _sp = solve_ibp_for(_cch, target)
+                                        if _sp is None:
+                                            if _isT: _SOL_WHY[0] = 'unsolvable'
+                                            continue
+                                        _fp = hash(frozenset(_sp.items()))
+                                        _seen = _SOL_FP.get(
+                                            (_efp, tuple(target), _op,
+                                             tuple(_dl)))
+                                        if _isT:
+                                            _SOL_WHY[0] = (
+                                                'fp_seen' if (_seen is not None
+                                                              and _fp in _seen)
+                                                else 'UNBANNED')
+                                            _SOL_WHY[1] = (len(_seen)
+                                                           if _seen else 0)
+                                            _wr = _SOL_WHO.get(
+                                                (_efp, tuple(target), _op,
+                                                 tuple(_dl)), [])
+                                            _mine = tuple(s.path)
+                                            _anc = any(
+                                                len(w) <= len(_mine) and
+                                                _mine[:len(w)] == w
+                                                for w in _wr)
+                                            _SOL_WHY.append(
+                                                f'writers={len(_wr)} '
+                                                f'ancestor_of_me={_anc} '
+                                                f'writer_depths='
+                                                f'{sorted(len(w) for w in _wr)}')
+                                        if _seen is None or _fp not in _seen:
+                                            _keep.append(_a)   # different sub
+                                    valid = _keep
+                                elif _LINEAGE_TABU:
+                                    _mypath = tuple(s.path)
+                                    _mylen = len(_mypath)
+                                    _efp2 = frozenset(s.expr.items())
+                                    _pfx = {}      # len -> hash(prefix), memoised
+                                    def _anc(_act):
+                                        _w = _BT_WHO.get(
+                                            (_efp2, target, _act))
+                                        if not _w:
+                                            return False
+                                        for _L, _H in _w:
+                                            if _L > _mylen:
+                                                continue
+                                            _h = _pfx.get(_L)
+                                            if _h is None:
+                                                _h = hash(_mypath[:_L])
+                                                _pfx[_L] = _h
+                                            if _h == _H:
+                                                return True
+                                        return False
+                                    valid = [a for a in valid
+                                             if a not in _bt_set or not _anc(a)]
+                                else:
+                                    valid = [a for a in valid
+                                             if a not in _bt_set]
+                                # BOUNDED TABU keys on (expression, target) --
+                                # NOT on the full state. Two states with the
+                                # same expression and different substitution
+                                # stores are different states with different
+                                # consequences, yet an action tried by one is
+                                # banned for the other.
+                                if _trace_fh is not None and _truth_actions:
+                                    _bn = len(s.path)
+                                    if (_bn < len(_truth_actions) and
+                                        all(s.path[_bi] == _truth_actions[_bi]
+                                            for _bi in range(_bn))):
+                                        _bta = _truth_actions[_bn]
+                                        if (tuple(target) == _bta[0]
+                                            and (_bta[1], _bta[2]) in _pre_bt
+                                            and (_bta[1], _bta[2]) not in valid):
+                                            import json as _jb
+                                            _trace_fh.write(_jb.dumps(dict(
+                                                event='BOUNDED_TABU_BANNED_TRUTH',
+                                                depth=_bn, why=_SOL_WHY[0],
+                                                n_seen_fps=_SOL_WHY[1],
+                                                writer=(_SOL_WHY[2]
+                                                        if len(_SOL_WHY) > 2
+                                                        else '?'),
+                                                n_before=len(_pre_bt),
+                                                n_after=len(valid),
+                                                n_blocked=int(_nblk))) + chr(10))
+                                            _trace_fh.flush()
                         if _v5_prof:
                             _p1['tabu'] += time.time() - _t
                     if valid:
+                        _PRECAP_STATS[0] += 1
+                        _PRECAP_STATS[1] += len(valid)
+                        _PRECAP_STATS[2] = max(_PRECAP_STATS[2], len(valid))
+                        if len(valid) > max_actions:
+                            _PRECAP_STATS[3] += 1
+                        if _precap_dump_dir:
+                            _PRECAP_BUF.append((tuple(target), list(valid)))
                         if _ACTION_SELECT != 'first900':
                             valid = _select_actions(valid, target, s.aux_flat,
                                                     max_actions, _ACTION_SELECT)
@@ -1827,8 +2659,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     nm = get_non_masters(s.expr, target_sector)
                     if not nm:
                         continue
-                    mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                    tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                    tied = [min(nm, key=_target_key)]  # v8: SINGLE full-order target
                     expr_fp_ = frozenset(s.expr.items())
                     ts_ = (tabu_dict.get(expr_fp_)
                            if tabu_dict is not None else None)
@@ -1971,8 +2802,7 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                         nm = get_non_masters(st.expr, target_sector)
                         if not nm:
                             continue
-                        mw = max(((weight(k)[0], weight(k)[1])) for k in nm)
-                        tied = [k for k in nm if (weight(k)[0], weight(k)[1]) == mw]
+                        tied = [min(nm, key=_target_key)]  # v8: SINGLE full-order target
                         # rebuild indirect_cache for re-enumeration
                         ic = (_aux_to_result(st.aux_flat, env)
                               if st.aux_flat is not None else None)
@@ -2079,31 +2909,26 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             probs_all[chunk_start:chunk_start + len(chunk), :cn] = chunk_probs
             del b, chunk_probs
         probs = probs_all
-        # OFF-MANIFOLD CONFIDENCE PROBE (SAILIR_CONF_PROBE=1). Logs the model's
-        # top score per (parent,target) task BEFORE beam selection, so it is not
-        # biased by the sort picking confident states. Training states are all
-        # on a valid reduction path; beam states after step ~1 are not. Compare
-        # these against the on-manifold baseline measured on val states.
-        if os.environ.get('SAILIR_CONF_PROBE') == '1':
-            with torch.no_grad():
-                _pm = probs.max(dim=1).values.tolist()
-            if _pm:
-                _sm = sorted(_pm)
-                _n = len(_sm)
-                print(f'  [CONFPROBE] step={step} n_tasks={_n} '
-                      f'max={_sm[-1]:.6f} p90={_sm[int(0.9*(_n-1))]:.6f} '
-                      f'median={_sm[_n//2]:.6f} p10={_sm[int(0.1*(_n-1))]:.6f} '
-                      f'min={_sm[0]:.6f} '
-                      f'frac>0.99={sum(v>0.99 for v in _sm)/_n:.3f}', flush=True)
         if _v5_prof:
             _p2['model_fwd'] += time.time() - _t
 
         # For each task, take top-K actions by prob, apply, generate candidates
-        K = max(1, top_k if top_k is not None else beam_width // 2)
+        # SAILIR_TOP_K decouples K from beam_width. They were entangled --
+        # K = beam_width//2 -- so the DUAL mode (beam 80 = 2 lanes x 40) would
+        # otherwise silently expand 40 actions per state instead of 20.
+        _envk = os.environ.get('SAILIR_TOP_K')
+        if _envk:
+            K = max(1, int(_envk))
+        else:
+            K = max(1, top_k if top_k is not None else beam_width // 2)
         _pick_dump_step = [] if _pick_dump_dir else None
         for ti, (parent_idx, target, valid) in enumerate(tasks):
             n_v = min(len(valid), probs.shape[1])
             row = probs[ti, :n_v].numpy()
+            if _ACTION_SCORE != 'model':
+                # Overridden HERE, before top-K/tabu/scoring, so the only thing
+                # that changes is where the scores come from.
+                row = _model_free_row(target, valid, n_v)
             parent_state = beam[parent_idx]
             if _bounded_tabu_on:
                 # Bounded tabu: block previously-tried (op,delta) for this
@@ -2114,7 +2939,32 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 _key_bt = (frozenset(parent_state.expr.items()), target)
                 _tset = _bt_tabu.get(_key_bt)
                 if _tset:
-                    _blk = [i for i in range(n_v) if valid[i] in _tset]
+                    if _LINEAGE_TABU:
+                        # Same ancestry rule as the pre-filter. Tabu is applied
+                        # in TWO places -- here and at the candidate filter --
+                        # so scoping only one leaves the action blocked here and
+                        # the fix silently does nothing.
+                        _mp = tuple(parent_state.path)
+                        _ml = len(_mp)
+                        _pf = {}
+                        def _anc2(_act):
+                            _w = _BT_WHO.get((_key_bt[0], _key_bt[1], _act))
+                            if not _w:
+                                return False
+                            for _L, _H in _w:
+                                if _L > _ml:
+                                    continue
+                                _h = _pf.get(_L)
+                                if _h is None:
+                                    _h = hash(_mp[:_L])
+                                    _pf[_L] = _h
+                                if _h == _H:
+                                    return True
+                            return False
+                        _blk = [i for i in range(n_v)
+                                if valid[i] in _tset and _anc2(valid[i])]
+                    else:
+                        _blk = [i for i in range(n_v) if valid[i] in _tset]
                 else:
                     _blk = []
                 _n_blocked = len(_blk)
@@ -2137,12 +2987,113 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     top_idx = np.argsort(-row)[:K]
                 # Record ALL picks into the tabu set (aggressive, like baseline).
                 _ts2 = _bt_tabu.setdefault(_key_bt, set())
+                _stamp = (len(parent_state.path),
+                          hash(tuple(parent_state.path))) if _LINEAGE_TABU else None
                 for _ai in top_idx:
-                    _ts2.add(valid[int(_ai)])
+                    _a2 = valid[int(_ai)]
+                    _ts2.add(_a2)
+                    if _LINEAGE_TABU:
+                        _BT_WHO.setdefault(
+                            (_key_bt[0], _key_bt[1], _a2), set()).add(_stamp)
             else:
                 # Take top-K by prob
                 top_idx = np.argsort(-row)[:K]
                 _n_blocked = -1
+            # TRUTH SCORE: what does the model actually give the truth action?
+            # `row` holds the model probabilities over `valid`, so this is the
+            # first place the real ranking exists -- the index inside `valid` is
+            # only enumeration order and says nothing about the model.
+            if _trace_fh is not None and _truth_actions:
+                _n = len(parent_state.path)
+                if (_n < len(_truth_actions) and
+                        all(parent_state.path[_i] == _truth_actions[_i]
+                            for _i in range(_n))):
+                    _ta = _truth_actions[_n]
+                    if tuple(target) != _ta[0]:
+                        import json as _j2
+                        _trace_fh.write(_j2.dumps(dict(
+                            event='TRUTH_TARGET_MISMATCH_AT_SCORER', depth=_n,
+                            beam_target=list(target),
+                            truth_target=list(_ta[0]))) + chr(10))
+                        _trace_fh.flush()
+                    if tuple(target) == _ta[0]:
+                        try:
+                            _vi = list(valid).index((_ta[1], _ta[2]))
+                        except ValueError:
+                            _vi = -1
+                        import json as _j
+                        if _vi >= 0:
+                            _ordr = np.argsort(-row)
+                            _rank = int(np.where(_ordr == _vi)[0][0])
+                            _trace_fh.write(_j.dumps(dict(
+                                event='TRUTH_SCORE', depth=_n,
+                                model_rank=_rank, K=int(K), n_valid=int(n_v),
+                                prob=float(row[_vi]),
+                                top_prob=float(row[_ordr[0]]),
+                                expanded=bool(_rank < K))) + chr(10))
+                        else:
+                            # reached the scorer but the action is GONE from
+                            # `valid` by this point -- distinguishes "dropped
+                            # somewhere between enumeration and scoring" from
+                            # "this code path was never reached at all"
+                            _trace_fh.write(_j.dumps(dict(
+                                event='TRUTH_MISSING_AT_SCORER', depth=_n,
+                                n_valid=int(n_v))) + chr(10))
+                        _trace_fh.flush()
+            # WAS A CLOSURE ACTION EVEN AVAILABLE HERE? For a parent that is
+            # still inside the library, find every enumerated action that is a
+            # library row for THIS target, and where the model ranked the best
+            # of them. Distinguishes the two readings of a library death:
+            #   avail=0            -> the state was structurally dead already;
+            #                         the real mistake was culling diversity
+            #                         earlier, and the fix is the beam.
+            #   avail>0, rank>=K   -> closure actions existed and the model
+            #                         ranked none inside the expanded top-K;
+            #                         the fix is the model.
+            # NOTE this also tests an assumption I had been making: library
+            # membership does NOT guarantee a completable walk. The recorder
+            # only ever picks rows that act on the CURRENT target, but the beam
+            # chooses its own target, so a library-consistent state can reach a
+            # target none of its remaining rows act on.
+            if _LIB is not None:
+                _q = np.asarray(row[:len(valid)], dtype=np.float64)
+                _q = _q[_q > 0]
+                _ALL_PARENT.append(dict(
+                    in_lib=bool(_in_library(parent_state)),
+                    depth=len(parent_state.path), n_valid=len(valid),
+                    top_prob=float(row[int(top_idx[0])]),
+                    H=float(-(_q * np.log(_q)).sum()) if _q.size else 0.0))
+            if _LIB is not None and _in_library(parent_state):
+                _liba = [_i for _i, (_o, _d) in enumerate(valid)
+                         if (int(_o), tuple(int(a) + int(b)
+                                            for a, b in zip(target, _d))) in _LIB]
+                _brank = -1
+                if _liba:
+                    _ordL = np.argsort(-row)
+                    _posL = {int(v): _r for _r, v in enumerate(_ordL)}
+                    _brank = min(_posL[_i] for _i in _liba if _i in _posL)
+                # how many of the ~20 CHILDREN this parent actually expands are
+                # library actions. anyhit20 only guarantees >=1 of K, i.e. a
+                # fraction >= 1/K; anything well above that is the model
+                # beating its own guarantee.
+                _tset = set(int(_i) for _i in top_idx)
+                _nk = len(_tset & set(_liba))
+                _LIB_PARENT.append(dict(
+                    depth=len(parent_state.path), n_valid=len(valid),
+                    avail=len(_liba), best_rank=_brank, K=int(K),
+                    n_children=len(_tset), lib_children=_nk,
+                    frac_children=round(_nk / max(len(_tset), 1), 3),
+                    # CALIBRATION SHAPE. A state with `avail` equally-correct
+                    # actions should carry ~1/avail on each, so top_prob*avail
+                    # ~= 1 when calibrated and >>1 when the model has piled its
+                    # mass on ONE member of a set it ought to be spreading over.
+                    # lib_mass is the total probability on the closure set.
+                    top_prob=float(row[int(top_idx[0])]),
+                    lib_mass=float(sum(row[_i] for _i in _liba)),
+                    conc=round(float(row[int(top_idx[0])]) * max(len(_liba), 1), 2),
+                    in_topk=bool(0 <= _brank < K),
+                    best_prob=(float(row[max(_liba, key=lambda i: row[i])])
+                               if _liba else 0.0)))
             if _pick_dump_step is not None:
                 _V_d = _n_blocked
                 _picked_d = tuple(sorted(
@@ -2156,12 +3107,62 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             # Tabu is recorded LATER — after beam selection and macro-dedup
             # — for ONLY the actions that actually survived into the next
             # beam, not every top-K attempt.
-            for ai in top_idx:
+            if _PROB_FLOOR > 0.0 and len(top_idx):
+                _keep_i = [int(i) for i in top_idx if row[int(i)] >= _PROB_FLOOR]
+                if not _keep_i:                 # never leave a state stranded
+                    _keep_i = [int(top_idx[0])]
+                top_idx = np.array(_keep_i, dtype=int)
+            if _ENT_BONUS > 0.0 or _ENT_CUT > 0.0:
+                try:
+                    _n_expanded
+                except NameError:
+                    _n_expanded = 0
+                    _n_ent_cut = 0
+                _pr = np.asarray(row[:len(valid)], dtype=np.float64)
+                _pr = _pr[_pr > 0]
+                _parent_H = float(-(_pr * np.log(_pr)).sum()) if _pr.size else 0.0
+                # AIM AT THE TAIL, NOT THE MEDIAN. The two populations overlap
+                # heavily (median entropy 2.653 lib vs 2.089 non-lib at the
+                # death window, a 1.3x difference), so no threshold separates
+                # them. But ~7-8% of parents sit at top_prob>0.9, and those are
+                # the ones whose children arrive at p~0.999 and take several
+                # slots at once. A LOW cut (0.5-1.0; top_prob 0.999 gives
+                # H~0.01) removes that tail while leaving the bulk untouched.
+                if _ENT_CUT > 0.0 and _parent_H < _ENT_CUT and _n_expanded > 0:
+                    _n_ent_cut += 1
+                    continue        # overconfident parent: do not expand
+                # counter lives ONLY on this path -- it is initialised in the
+                # same block, so incrementing it outside would crash every run
+                # that sets neither ENT_BONUS nor ENT_CUT, i.e. the DEFAULT.
+                _n_expanded += 1
+            for _rk, ai in enumerate(top_idx):
                 ai = int(ai)
                 op, delta = valid[ai]
                 _t = time.time() if _v5_prof else 0
+                # RANK SCORE (SAILIR_RANK_SCORE=1): feed the model's RANK rather
+                # than its probability. top_idx is argsort(-row), so _rk is the
+                # rank directly. Passing 1/(1+rank) makes the stored score
+                # -log(1+rank): 0, -0.69, -1.10 for ranks 1,2,3.
+                #
+                # Why: the beam sorts on log p, but the model's mass is
+                # saturated while its ranking is fine. Measured on 2,1,0 at the
+                # two steps that lose the truth trajectory, the correct action
+                # was ranked 3rd and 2nd -- inside every top-K metric we select
+                # on -- yet carried p=0.062 and p=0.0104 against top picks of
+                # 0.734 and 0.988. As log p that is a 1.0 and 4.6 nat deficit,
+                # unreachable by any (w2, nm) reweighting. As rank it is 1.10
+                # and 0.69 nats, which the structural terms can outvote.
+                if _RANK_SCORE:
+                    _ap = 1.0 / (1.0 + _rk)
+                elif _REL_SCORE:
+                    _mx = float(row[int(top_idx[0])])
+                    _ap = float(row[ai]) / _mx if _mx > 0 else float(row[ai])
+                elif _ENT_BONUS > 0.0:
+                    _ap = float(row[ai]) * math.exp(_ENT_BONUS * _parent_H)
+                else:
+                    _ap = float(row[ai])
                 result = apply_action_v5(
-                    parent_state, target, op, delta, float(row[ai]),
+                    parent_state, target, op, delta, _ap,
                     env, target_sector, start_w12,
                     use_incremental_aux=use_incremental_aux,
                     lazy_rs=lazy_rs,
@@ -2184,13 +3185,91 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                 print(f'[v6 step {step}] no successful candidates — STUCK', flush=True)
             break
 
+        # EARLY SUCCESS (2026-08-04): if any freshly-generated child already
+        # satisfies the success predicate, TAKE IT NOW — before the top-K prob
+        # cull. A bucket-clearing move is correct regardless of the model's
+        # probability for it; subjecting it to the probability ranking lets a
+        # low-prob winner be generated and then discarded, which stalled the
+        # frozen-7 runs for 2000 steps at nm=1 (the clearing move existed and
+        # was reachable every step but never ranked in the top-40). This
+        # generalizes the top-of-loop line-1632 check to the candidate set.
+        # cand_metadata is parallel to candidates (appended together), so the
+        # index maps directly; materialize the winner's lazy resolved_subs so
+        # best_state._asdict() is consistent (the authoritative output is
+        # replay_full_expr(best_state.path), which is path-only regardless).
+        _win_i = next((i for i, c in enumerate(candidates)
+                       if _is_success(c, target_sector)), None)
+        if _win_i is not None:
+            _wc = candidates[_win_i]
+            _wp, _wt_tgt, _wsol = cand_metadata[_win_i]
+            if lazy_rs:
+                _wc = _materialize_lazy_rs(_wc, _wp, _wt_tgt, _wsol, start_w12)
+            best_state = _wc
+            if verbose:
+                print(f'[v6 step {step}] EARLY SUCCESS — bucket-clearing move '
+                      f'taken pre-cull (path_len={len(_wc.path)}'
+                      + (f', lane={_wc.lane}' if beam_sort == 'dual' else '')
+                      + ')', flush=True)
+            break
+
         # Beam selection
         _t_sort = time.time() if _v5_prof else 0
         # Build id() → metadata-index map so we can find each survivor's parent.
         meta_by_id = {id(c): i for i, c in enumerate(candidates)}
         if beam_sort == 'weight':
-            candidates.sort(key=sort_weight)
-            beam = candidates[:beam_width]
+            if _TOPN_PROB > 0:
+                _byp = sorted(candidates, key=lambda c: -c.score)[:_TOPN_PROB]
+                _res = {id(c) for c in _byp}
+                _rest = [c for c in candidates if id(c) not in _res]
+                _rest.sort(key=sort_weight)
+                beam = _byp + _rest[:max(0, beam_width - len(_byp))]
+            else:
+                candidates.sort(key=sort_weight)
+                beam = candidates[:beam_width]
+        elif beam_sort == 'prob':
+            if _W1_DROP and start_w12 is not None:
+                _kept = [c for c in candidates
+                         if c.max_w12[0] <= start_w12[0]]
+                if _kept:            # never strand the beam
+                    candidates = _kept
+            candidates.sort(key=sort_prob)
+            if _RESERVE_PARENT:
+                # ONE RESERVED SLOT PER PARENT, then fill by probability.
+                #
+                # MEASURED JUSTIFICATION (soft_ep10, target 2,1,0, steps 49-51,
+                # 18 library-consistent parents observed): a closure action was
+                # enumerable for EVERY one of them (avail 1-48, never 0), and
+                # the model ranked a closure action FIRST for 15 of 18 -- rank 0
+                # out of 2400-3500 enumerated actions. The model is not
+                # failing. But those rank-1-correct children carry p=0.05-0.11,
+                # while non-library parents emit rank-1-wrong children at
+                # p=0.999, so the global sort discards every correct one.
+                #
+                # score is log(action_prob) under the PARENT'S OWN softmax, over
+                # action sets of wildly different size (70 to 3500) and
+                # difficulty. Those numbers are not commensurable across
+                # parents, yet the cull compares them directly.
+                #
+                # Why reservation and not re-scoring: normalising per parent
+                # (SAILIR_REL_SCORE) scored 19 vs 52, and round-robin by rank
+                # (SAILIR_RANK_SCORE) 42 -- both throw away the real signal
+                # absolute probability carries about WHICH PARENTS deserve
+                # expansion. Reservation keeps that signal for every slot beyond
+                # the guarantee, and only guarantees each parent its own best
+                # child. Parent identity is path[:-1]; candidates are already
+                # sorted, so the first one seen per parent IS its best.
+                _seen = set()
+                _res, _rest = [], []
+                for _c in candidates:
+                    _k = tuple(_c.path[:-1])
+                    if _k not in _seen and len(_res) < beam_width:
+                        _seen.add(_k)
+                        _res.append(_c)
+                    else:
+                        _rest.append(_c)
+                beam = (_res + _rest)[:beam_width]
+            else:
+                beam = candidates[:beam_width]
         elif beam_sort == 'mixed':
             half = beam_width // 2
             by_w = sorted(candidates, key=sort_weight)
@@ -2219,14 +3298,84 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                     seen.add(cid)
                     new_beam.append(c)
             beam = new_beam
-        elif beam_sort == 'prob':
-            candidates.sort(key=sort_prob)
-            beam = candidates[:beam_width]
-        elif beam_sort == 'prob_nm':
-            candidates.sort(key=sort_prob_nm)
-            beam = candidates[:beam_width]
+        elif beam_sort == 'wprob':
+            # HETEROGENEOUS beam: half ranked by weight, half by the model's
+            # local log-prob minus the nm drain penalty (SAILIR_NM_PENALTY = the
+            # lambda). Unlike 'mixed', which splits between two WEIGHT rules
+            # (max_w12 vs total_w12) and so shares their blind spots, this
+            # splits between rules with DIFFERENT failure profiles: weight-sort
+            # prunes weight-uphill stretches structurally and solved the three
+            # previously-irreducible integrals, while prob-sort lets a confident
+            # learned route survive those stretches and closed integral B in far
+            # fewer steps. Neither dominates, and the wsort100 stragglers were
+            # never tried under prob at all -- so run both halves at once rather
+            # than betting the whole beam on one rule.
+            #
+            # Weight half FIRST, and it also backfills: if one rule produces too
+            # few distinct states, the beam is topped up rather than left short,
+            # and weight-sort is the half with the better solve record.
+            half = beam_width // 2
+            new_beam = []
+            seen = set()
+
+            def _take(ordered, upto):
+                for c in ordered:
+                    if len(new_beam) >= upto:
+                        return
+                    cid = id(c)
+                    if cid not in seen:
+                        seen.add(cid)
+                        new_beam.append(c)
+
+            by_w = sorted(candidates, key=sort_weight)
+            _take(by_w, half)
+            _take(sorted(candidates, key=sort_prob), beam_width)
+            _take(by_w, beam_width)
+            beam = new_beam
+        elif beam_sort == 'dual':
+            # TRULY DISJOINT DOUBLE BEAM. Two sub-beams that never compete:
+            #   lane 0 -- ranked by sort_weight  (the original beam)
+            #   lane 1 -- ranked by sort_prob    (model log-prob minus lambda*nm)
+            # Each lane selects ONLY from candidates descended from itself
+            # (children inherit `lane`), and each gets its own fixed
+            # beam_width//2 slots with NO cross-lane backfill.
+            #
+            # This is the difference from 'wprob', which pools all candidates
+            # and applies both sorts to the shared pool. There, a state only
+            # prob-sort valued got one step of life and then had to out-compete
+            # weight-favoured siblings to reproduce, so a prob lineage could be
+            # starved; shortfalls were also backfilled from weight, never the
+            # reverse. Measured on 1,4,0,1,1,0,0,0,2,1: pure prob-sort solved it
+            # in 245 steps and the pooled wprob beam took 3,143 with the same
+            # model -- i.e. pooling cost ~13x on that target. Here neither lane
+            # can crowd the other out, so the run should be no worse than the
+            # better of its two lanes.
+            lane_w = max(1, beam_width // 2)
+            lane0 = [c for c in candidates if c.lane == 0]
+            lane1 = [c for c in candidates if c.lane == 1]
+            beam = (sorted(lane0, key=sort_weight)[:lane_w]
+                    + sorted(lane1, key=sort_prob)[:lane_w])
+            if verbose:
+                # Report BOTH lane populations. A lane persistently below
+                # lane_w means it is starved of distinct candidates -- which
+                # would silently turn this back into a single-lane search, the
+                # exact failure this mode exists to prevent.
+                print(f'[v6 step {step}] dual: lane0(w)={min(len(lane0), lane_w)}'
+                      f'/{lane_w} from {len(lane0)} cand, '
+                      f'lane1(p)={min(len(lane1), lane_w)}/{lane_w} from '
+                      f'{len(lane1)} cand', flush=True)
         else:
             raise ValueError(f'unknown beam_sort {beam_sort}')
+
+        # TRUTH-TRACE: record where the truth trajectory sits relative to this
+        # step's selection. Placed AFTER the beam is chosen and BEFORE the
+        # early macro-dedup, so `candidates` is the full generated set and
+        # `beam` is exactly what survived the sort -- the two populations the
+        # mode-A / mode-B distinction is defined over. No-op unless
+        # SAILIR_TRUTH_TRACE is set.
+        if _trace_fh is not None:
+            _truth_trace_step(step, _trace_parents, candidates, beam,
+                              sort_weight, sort_prob, cand_metadata)
 
         if _v5_prof:
             _p3['sort'] += time.time() - _t_sort
@@ -2243,6 +3392,8 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
             early_groups = {}
             for s in beam:
                 efp = frozenset(s.expr.items())
+                if beam_sort == 'dual':
+                    efp = (efp, s.lane)   # keep the lanes separate (see above)
                 cur = early_groups.get(efp)
                 if cur is None or (s.max_w12, s.n_non_masters, -s.score) < \
                                   (cur.max_w12, cur.n_non_masters, -cur.score):
@@ -2429,9 +3580,16 @@ def beam_search_v5(env, model, start_expr, target_sector, start_w12,
                   f'rs={sz_rs} rs_vsz={rs_vsz} '
                   f'expr={len(best_in_beam.expr)} '
                   f'cand={len(candidates)} '
+                  f'precap(tasks={_PRECAP_STATS[0]} tot={_PRECAP_STATS[1]} '
+                  f'max={_PRECAP_STATS[2]} capped={_PRECAP_STATS[3]}) '
                   f't_step={time.time()-t_step:.1f}s '
                   f't_total={time.time()-t0:.1f}s',
                   flush=True)
+            if _precap_dump_dir and _PRECAP_BUF:
+                with open(f'{_precap_dump_dir}/precap_step{step}.pkl', 'wb') as _pf:
+                    pickle.dump(_PRECAP_BUF, _pf)
+            _PRECAP_BUF.clear()
+            _PRECAP_STATS[:] = [0, 0, 0, 0]
             if _v5_prof:
                 p1_t = sum(_p1.values())
                 p2_t = sum(_p2.values())
@@ -2807,33 +3965,12 @@ def main():
     # prime is REQUIRED (no default since the 2026-07-15 bug fix): take it from
     # the checkpoint's own training args, falling back to the CLI prime.
     ck = torch.load(args.model, map_location='cpu', weights_only=False)
-    _cka = ck.get('args') or {}
-    # Pick the class the checkpoint was TRAINED with. Defaults to the historical
-    # IBPActionClassifier so every pre-existing checkpoint loads exactly as before;
-    # a 'nosubs' checkpoint has no subs_enc.* keys and would fail load_state_dict
-    # against the full class.
-    _variant = _cka.get('model_variant', 'full')
-    # score_activation decides forward()'s SECOND return value, which is what
-    # this beam consumes as action_prob. 'sigmoid' for bce-trained models --
-    # softmax would divide by sum_j exp(z_j) over the action set and reimpose
-    # the action-count dependence those models are trained without.
-    _act = _cka.get('score_activation', 'softmax')
-    _mkw = dict(
-        prime=_cka.get('prime', args.prime),
+    model = IBPActionClassifier(
+        prime=(ck.get('args') or {}).get('prime', args.prime),
         n_indices=topology.n_indices,
         n_denominators=topology.n_denominators,
         n_ibp_ops=topology.n_actions,
     )
-    for _k in ('embed_dim', 'n_heads', 'n_expr_layers', 'n_cross_layers'):
-        if _k in _cka:
-            _mkw[_k] = _cka[_k]
-    if _variant == 'nosubs':
-        from sailir.classifier_nosubs import IBPActionClassifierNoSubs
-        model = IBPActionClassifierNoSubs(score_activation=_act, **_mkw)
-    else:
-        model = IBPActionClassifier(**_mkw)
-    print(f'  model_variant = {_variant}  score_activation = {_act}  '
-          f'prime = {_mkw["prime"]}', flush=True)
     model.load_state_dict(ck['model_state_dict'])
     model.eval()
     if _memprobe_mod is not None:
@@ -2848,7 +3985,9 @@ def main():
     global _START_TOTAL_KEY
     _START_TOTAL_KEY = _target_key(start_int)   # for SAILIR_SUCCESS_TOTAL=1
     print(f'  start integral weight = {start_w}', flush=True)
-    print(f'  active threshold      = (w1,w2) >= {start_w12}', flush=True)
+    print(f'  active threshold      = (w1,w2) >= {start_w12}'
+          + (f' AND total-order <= start ({_START_TOTAL_KEY})'
+             if _STRIP_TOTAL else '  [total-order strip OFF]'), flush=True)
     print(f'  SINGLE-STEP reducer; success criterion = '
           f'{"TOTAL-weight active bucket drained" if _SUCCESS_TOTAL else "(w1,w2) active bucket drained"}',
           flush=True)
@@ -2856,8 +3995,28 @@ def main():
     # lower-weight). Must be BEFORE any raw is cached. Replay uses the unstripped
     # get_raw_equation, so final_expr is unaffected. SAILIR_STRIP_RAWS=0 disables.
     if os.environ.get('SAILIR_STRIP_RAWS', '1') != '0':
-        ibp_env.set_raw_strip_threshold(start_w12)
-        print(f'  raw-strip: cached raws stripped to (w1,w2) >= {start_w12}', flush=True)
+        # With the total-order strip on, the ACTIONS must be stripped the same
+        # way as the expression, or the two disagree: the expression drops
+        # same-(r,s)/larger-|abs| terms while every raw equation keeps
+        # generating them. get_raw_equation already accepts a 3-tuple meaning
+        # the FULL total ordering (keep unless below the start), and weight()
+        # returns exactly (w0, w1, |abs|-tuple), so the start's own weight IS
+        # the threshold. Out-of-cone terms stay exempt either way.
+        _raw_thr = weight(start_int) if _STRIP_TOTAL else start_w12
+        ibp_env.set_raw_strip_threshold(_raw_thr)
+        if _SECTOR_RANK:
+            # sector-senior order only (see onestep_worker_v7): out-of-cone
+            # terms are exempt from the strip so the subsector filter can
+            # reject sector-raising (den-row backward) actions. Legacy order
+            # keeps the plain strip (out-of-cone sub-weight = genuinely below).
+            ibp_env.set_raw_strip_cone(_sector_mask(start_int))
+            print(f'  raw-strip: threshold {_raw_thr} '
+                  f'({"TOTAL order" if _STRIP_TOTAL else "(w1,w2)"}), '
+                  f'out-of-cone exempt', flush=True)
+        else:
+            print(f'  raw-strip: cached raws stripped to {_raw_thr} '
+                  f'({"TOTAL order" if _STRIP_TOTAL else "(w1,w2)"})',
+                  flush=True)
 
     target_sector = tuple(get_sector_mask(start_int))
     print(f'  target_sector = {target_sector}', flush=True)

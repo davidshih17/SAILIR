@@ -30,6 +30,7 @@ import os
 import resource
 from pathlib import Path
 from collections import defaultdict
+import heapq
 
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))   # repo root (SAILIR_phase2) for `sailir`
@@ -42,6 +43,10 @@ _DIVERGE_LINE = _re.compile(
     r'nm=(\d+).*?rs_vsz=(\d+).*?t_total=([0-9.]+)')
 from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
 from beam_search_utils import get_sector_mask
+# The workers' total order -- ONE definition, reduction/total_order.py.
+# Imported from there rather than from symmetry_route, which loads the transform
+# store at import time and would drag it into every run.
+from total_order import tkey as _tkey
 
 REPO_DIR = Path(__file__).parent.parent.resolve()
 PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with SAILIR_PYTHON env var if Condor workers need a different interpreter
@@ -52,7 +57,7 @@ def integral_to_str(integral):
     return '_'.join(str(x) for x in integral)
 
 
-def apply_substitutions(expr, cache, prime):
+def apply_substitutions(expr, cache, prime, progress=0):
     """Apply all cached substitutions to an expression until no more apply.
 
     This recursively substitutes any integral that's in the cache with its
@@ -77,42 +82,95 @@ def apply_substitutions(expr, cache, prime):
     # entry (cache[i] == {i: 1}, written for a FAILED worker) would re-enqueue
     # itself forever, so it is skipped explicitly -- the old code relied on its
     # 10000-iteration guard for that, which silently did 10000 full rebuilds.
+    # TOPOLOGICAL ORDER, NO CAP, NO TRUNCATION.
+    #
+    # Reductions and routing rules are strictly descending in the WORKERS' total
+    # order, tkey: smaller tkey == higher == eliminated first, and a valid rule
+    # sends an integral to terms with strictly LARGER tkey. So popping the
+    # smallest tkey first is a topological order -- when a term is popped, every
+    # term that could contribute to it has already been processed, and it is
+    # substituted exactly once with its final coefficient. That is what makes
+    # this terminate without any step limit.
+    #
+    # TWO EARLIER VERSIONS OF THIS FUNCTION WERE WRONG, both measured on the live
+    # resume replay against the original's 312.1s:
+    #   - unordered worklist: converges, but a term reached by several
+    #     predecessors is substituted early with a partial coefficient, re-added
+    #     and substituted again. 546s+ and still running when killed -- SLOWER
+    #     than the rebuild-until-fixpoint it replaced.
+    #   - heap ordered by full_weight (L, r, s): the WRONG ORDER. Rules descend
+    #     in tkey, which is sector-rank-senior, so a rule can move to a higher
+    #     full_weight while still descending in tkey. The topological guarantee
+    #     did not hold, terms were reprocessed forever, and a 10M-step guard
+    #     TRUNCATED the fold -- leaving |expr|=100175 instead of 714538 and
+    #     reporting "145.7s" as though it were a result.
+    #
+    # There is no step cap here by design. A truncated fold is silently wrong
+    # state, which is far worse than a slow one. If a cache entry ever violates
+    # descent, that is a CORRECTNESS bug elsewhere and must surface as an error,
+    # not be absorbed by a cap -- hence the explicit check below.
     expr = {k: v % prime for k, v in expr.items() if v % prime}
-    todo = [k for k in expr if k in cache]
-    seen_guard = 0
-    while todo:
-        seen_guard += 1
-        if seen_guard > 10_000_000:
-            print("WARNING: apply_substitutions worklist exceeded 10M steps",
-                  flush=True)
-            break
-        nxt = []
-        for k in todo:
-            rule = cache.get(k)
-            if rule is None:
-                continue
-            coeff = expr.pop(k, 0)
-            if not coeff:
-                continue
-            if len(rule) == 1 and k in rule:
-                # identity entry (failed worker): substituting is a no-op that
-                # would re-enqueue k forever. Keep the term as it stands.
-                expr[k] = (expr.get(k, 0) + coeff * rule[k]) % prime
-                if not expr[k]:
-                    del expr[k]
-                continue
-            for sub_int, sub_coeff in rule.items():
-                if not sub_coeff:
-                    continue
-                v = (expr.get(sub_int, 0) + coeff * sub_coeff) % prime
-                if v:
-                    expr[sub_int] = v
-                    if sub_int in cache and sub_int != k:
-                        nxt.append(sub_int)
-                else:
-                    expr.pop(sub_int, None)
-        todo = nxt
+    heap = []
+    queued = set()
+    done = set()
 
+    def _push(k):
+        if k in queued:
+            return
+        queued.add(k)
+        heapq.heappush(heap, (_tkey(k), k))     # min-heap: smallest tkey first
+
+    for k in expr:
+        if k in cache:
+            _push(k)
+
+    t_fold = time.time()
+    n_pop = 0
+    n_start = len(heap)
+    while heap:
+        _, k = heapq.heappop(heap)
+        queued.discard(k)
+        n_pop += 1
+        if progress and n_pop % progress == 0:
+            print(f"    [fold] {n_pop:,} substituted, {len(heap):,} queued, "
+                  f"|expr|={len(expr):,}, {time.time()-t_fold:.0f}s", flush=True)
+        rule = cache.get(k)
+        if rule is None:
+            continue
+        coeff = expr.pop(k, 0)
+        if not coeff:
+            done.add(k)
+            continue
+        if len(rule) == 1 and k in rule:
+            # identity entry (failed worker): substituting is a no-op that would
+            # re-enqueue k forever, so put the term back and move on.
+            v = (coeff * rule[k]) % prime
+            if v:
+                expr[k] = v
+            done.add(k)
+            continue
+        kk = _tkey(k)
+        for sub_int, sub_coeff in rule.items():
+            if not sub_coeff:
+                continue
+            if _tkey(sub_int) <= kk:
+                raise AssertionError(
+                    f"apply_substitutions: cache rule for {list(k)} emits "
+                    f"{list(sub_int)} which is NOT strictly lower in the order "
+                    f"(tkey {_tkey(sub_int)} <= {kk}). Substitution would not "
+                    f"terminate; this is a correctness bug in whatever produced "
+                    f"that rule.")
+            v = (expr.get(sub_int, 0) + coeff * sub_coeff) % prime
+            if v:
+                expr[sub_int] = v
+                if sub_int in cache and sub_int not in done:
+                    _push(sub_int)
+            else:
+                expr.pop(sub_int, None)
+        done.add(k)
+    if progress and n_pop >= progress:
+        print(f"    [fold] done: {n_pop:,} substitutions from {n_start:,} seeds "
+              f"in {time.time()-t_fold:.0f}s, |expr|={len(expr):,}", flush=True)
     return expr
 
 

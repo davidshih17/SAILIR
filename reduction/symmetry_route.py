@@ -45,29 +45,10 @@ if _SECTOR_RANK:
 # which the symmetry merge breaks -- so ALWAYS use --paper-masters-only here.)
 
 
-def tkey(i):
-    """The WORKERS' total order = beam_search_v7._target_key = (-r, -s, |abs|).
-    SMALLER tkey == HIGHER in the ordering == the integral IBP eliminates first.
-    A valid reduction sends an integral to terms with strictly LARGER tkey (lower
-    in the ordering). symmetry_route MUST use this exact order, or its rewrites run
-    opposite to the workers on the |abs| tiebreak and the mixed cache cycles.
-
-    DESIGN DECISION 2026-07-10 (see reduction/ORDERING.md): the adopted order is
-    SECTOR RANK first, then (r,s), then |abs| — it gives the HARD guarantee that
-    only canonical sectors are ever dispatched (legacy order leaks 2.6-15% of
-    dispatches into non-canonical sectors via the |abs| tiebreak). This function
-    still implements the LEGACY order; migrate JOINTLY with beam_search_v7,
-    canonical_rep, and data-gen at the retrain — never alone.
-    SAILIR_SECTOR_RANK=1 switches to the adopted order (rank prefix)."""
-    base = (-sum(x for x in i if x > 0), -sum(-x for x in i if x < 0),
-            tuple(abs(x) for x in i))
-    if not _SECTOR_RANK:
-        return base
-    m = 0
-    for k in range(_N_DEN):
-        if i[k] > 0:
-            m |= 1 << k
-    return (-_RANK_IDX[m],) + base
+# Total order: ONE definition, reduction/total_order.py. Re-implementing it
+# here is how canonical_rep drifted to a range(8) sector mask and disagreed
+# with the live order on 69% of gravity3L integrals.
+from total_order import tkey as tkey  # noqa: E402
 
 
 def _build_rules(seeds, cap=20000):
