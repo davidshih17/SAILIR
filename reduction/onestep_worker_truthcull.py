@@ -130,7 +130,14 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
                   f'beam search', flush=True)
             return
         k0 = tkey(I)
-        assert all(tkey(k) > k0 for k in rule), 'sym-first rule not descending'
+        # DESCENT IS MODULO THE TERMINAL SET, matching symmetry_rule. A term
+        # that is a master or corner needs no further reduction wherever it sits
+        # in the order, so it cannot close a worker/symmetry cycle. A raw tkey
+        # assertion here would KILL THE WORKER on a rule the router legitimately
+        # returns. ibp_env is initialised just above, so is_master is the real
+        # terminal set (basis UNION corners in uncovered sectors).
+        assert all(tkey(k) > k0 or _ie.is_master(k) for k in rule), \
+            'sym-first rule neither descending nor terminal'
         result = {
             'success': True,
             'original_integral': I,

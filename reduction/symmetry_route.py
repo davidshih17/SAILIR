@@ -100,7 +100,19 @@ def _build_rules(seeds, cap=20000):
         r = _reduce(rel, rules)
         if not r:
             continue
-        piv = max(r, key=lambda v: pos[v])                        # eliminate highest-in-ordering
+        # A MASTER OR CORNER MUST NEVER BE THE PIVOT. Pivoting eliminates the
+        # chosen integral by rewriting it in terms of the others -- so pivoting
+        # on a terminal REWRITES A BASIS ELEMENT, changing the basis the whole
+        # reduction is expressed in. pos ranks by raw tkey with no terminality
+        # notion, so a master that happens to be highest-in-ordering in its orbit
+        # would be selected and eliminated.
+        # A relation whose every term is terminal cannot eliminate anything: it
+        # is a linear relation among basis elements, so skip it rather than
+        # rewrite one away.
+        _pivotable = [v for v in r if not _terminal(v)]
+        if not _pivotable:
+            continue
+        piv = max(_pivotable, key=lambda v: pos[v])               # highest-in-ordering NON-terminal
         co = r.pop(piv); inv = pow(co, P - 2, P)
         newp = {k: (-v * inv) % P for k, v in r.items()}
         for q in list(rules):
@@ -259,7 +271,11 @@ def _build_rules_within(I, S, cap=20000):
         r = _reduce(rel, rules)
         if not r:
             continue
-        piv = max(r, key=lambda v: pos[v])
+        # same rule as _build_rules: never pivot on a terminal (see there)
+        _pivotable = [v for v in r if not _terminal(v)]
+        if not _pivotable:
+            continue
+        piv = max(_pivotable, key=lambda v: pos[v])
         co = r.pop(piv); inv = pow(co, P - 2, P)
         newp = {k: (-v * inv) % P for k, v in r.items()}
         for q in list(rules):
@@ -361,6 +377,7 @@ if __name__ == "__main__":
             print(f"  {I}  ->  0  (symmetry-zero)")
         else:
             k = tkey(I)
-            lo = all(tkey(t) > k for t in r)     # lower in ordering (larger tkey)
+            # descend OR be terminal, same rule the router applies
+            lo = all(tkey(t) > k or _terminal(t) for t in r)
             terms = " + ".join(f"{c}*{t}" for t, c in list(r.items())[:3])
             print(f"  {I}  ->  {terms}{' + ...' if len(r) > 3 else ''}   [lower-in-ordering={lo}]")
