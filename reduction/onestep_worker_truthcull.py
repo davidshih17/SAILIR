@@ -123,7 +123,31 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
             apply_canonical_masters()
         from symmetry_route import canonical_monolithic_rule, tkey
         I = tuple(int(x) for x in integ.strip("'").strip('"').split(','))
-        rule = canonical_monolithic_rule(I)
+        # TIME-LIMIT THE ROUTE. Routing cost is bimodal to an extreme degree:
+        # measured over 104,383 integrals the MEDIAN routes in 1.2s and p90 in
+        # 3.2min, but a tail runs for HOURS (one observed still going at 6.7h).
+        # Unbounded here, a single such integral holds this worker for hours
+        # before it even starts the beam search it was dispatched to do.
+        # Timing out is lossless: we simply fall through to that beam search,
+        # exactly as for any integral symmetry cannot route.
+        _tl = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
+        if _tl > 0:
+            import signal
+
+            def _sym_alarm(signum, frame):
+                raise TimeoutError('sym-first route exceeded the time limit')
+
+            signal.signal(signal.SIGALRM, _sym_alarm)
+            signal.alarm(_tl)
+        try:
+            rule = canonical_monolithic_rule(I)
+        except TimeoutError:
+            print(f'[sym-first] route exceeded {_tl}s — proceeding to beam '
+                  f'search', flush=True)
+            return
+        finally:
+            if _tl > 0:
+                signal.alarm(0)
         el = time.time() - t0
         if rule is None:
             print(f'[sym-first] survivor after {el:.1f}s — proceeding to '
