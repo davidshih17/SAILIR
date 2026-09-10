@@ -1274,6 +1274,16 @@ def main():
                           f"(limit {_rt_limit}s/integral)", flush=True)
                     sym_memo.update(route_batch_condor(
                         _new_c, str(work_dir), f"i{iteration}"))
+                # EVERY CANDIDATE MUST END UP WITH AN ENTRY. The loop below does
+                # sym_memo[I] for every I in cand, so any candidate left without
+                # one is a KeyError that kills the orchestrator after the full
+                # cache load and substitution replay (~14 min to reproduce).
+                # Two ways that happens: bulk routing is disabled (the default --
+                # workers route themselves via SAILIR_SYM_FIRST), or it ran but
+                # returned nothing for some integral. Absent means NOT ROUTED,
+                # which is None: survivor -> worker dispatch.
+                for I_ in _new_c:
+                    sym_memo.setdefault(I_, None)
                 # SIZE CAP, same rule as routing_closure_worker: a route that
                 # produces more terms than this is expression GROWTH, not
                 # reduction (measured: s=20 -> 1,315,600 terms against a
