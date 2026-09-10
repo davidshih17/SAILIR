@@ -19,7 +19,7 @@
     "against results/truth/finetune/gval, timing median 1.002x."
   ],
   "env_set": {
-    "_why": "Semantic. Wrong or missing -> a different search that still reports success. SAILIR_ROUTE_MAX_S gates symmetry routing by total numerator degree s: above it, an integral is not routed at all and goes to worker dispatch. s is a PROXY, not the cause -- routing cost comes from the CASCADE (canonical_monolithic_rule composes across transforms and recursively routes what it emits), and neither s nor the individual numerator powers predict it. Measured: s=24 with powers {3,7,14} routed to ONE term, s=16 with powers {8,1,7} gave 6,435, s=20 gave 1,315,600. What s buys is PREDICTABILITY and a check that costs nothing (it runs BEFORE the expansion, unlike SAILIR_ROUTE_MAX_TERMS which only rejects after the terms are built). Everything sampled at s<=5 produced small rules: 0, 1, 16, 45 terms. The price is forgoing cheap high-s wins like that s=24 single-term route. SAILIR_SYM_FIRST=1 makes each dispatched worker attempt the symmetry route on its own target before loading torch (greedy_worker._sym_first), returning steps=0 with method='symmetry' on success and falling through to beam search otherwise. SAILIR_ROUTE_BULK=0 disables the orchestrator's speculative pre-routing of the whole frontier, which cost ~5,700 CPU-hours for a single 104,383-integral pass and blocked the orchestrator while it ran.",
+    "_why": "Semantic. Wrong or missing -> a different search that still reports success. SAILIR_ROUTE_MAX_S gates symmetry routing by total numerator degree s: above it, an integral is not routed at all and goes to worker dispatch. s is a PROXY, not the cause -- routing cost comes from the CASCADE (canonical_monolithic_rule composes across transforms and recursively routes what it emits), and neither s nor the individual numerator powers predict it. Measured: s=24 with powers {3,7,14} routed to ONE term, s=16 with powers {8,1,7} gave 6,435, s=20 gave 1,315,600. What s buys is PREDICTABILITY and a check that costs nothing (it runs BEFORE the expansion, unlike SAILIR_ROUTE_MAX_TERMS which only rejects after the terms are built). Everything sampled at s<=5 produced small rules: 0, 1, 16, 45 terms. The price is forgoing cheap high-s wins like that s=24 single-term route. SAILIR_SYM_FIRST=1 makes each dispatched worker attempt the symmetry route on its own target before loading torch (greedy_worker._sym_first), returning steps=0 with method='symmetry' on success and falling through to beam search otherwise. SAILIR_ROUTE_BULK=0 disables the orchestrator's speculative pre-routing of the whole frontier, which cost ~5,700 CPU-hours for a single 104,383-integral pass and blocked the orchestrator while it ran. SAILIR_SYM_FIRST=1 makes each dispatched worker attempt the symmetry route on its own target before loading torch (greedy_worker._sym_first): success returns steps=0 with method='symmetry', failure falls through to beam search. The orchestrator does NOT route -- its bulk pre-routing block was removed entirely -- so SAILIR_ROUTE_MAX_S, SAILIR_ROUTE_MAX_TERMS, SAILIR_ROUTE_MAX_EXPAND and SAILIR_ROUTE_TIME_LIMIT are all read in the WORKER path (greedy_worker / canonicalize2). MAX_S is checked before routing so a skipped integral costs nothing; TIME_LIMIT only bails after spending its budget.",
     "SAILIR_SUCCESS_TOTAL": "1",
     "SAILIR_BEAM_TOTAL": "1",
     "SAILIR_SECTOR_RANK": "1",
@@ -33,12 +33,8 @@
     "SAILIR_ROUTE_MAX_TERMS": "200",
     "SAILIR_ROUTE_MAX_S": "5",
     "SAILIR_ROUTE_MAX_EXPAND": "20000",
-    "SAILIR_ROUTE_BATCH": "1",
-    "SAILIR_ROUTE_SUBMIT_CHUNK": "5000",
-    "SAILIR_ROUTE_QUEUE_CEILING": "8000",
     "SAILIR_ROUTE_TIME_LIMIT": "300",
-    "SAILIR_SYM_FIRST": "1",
-    "SAILIR_ROUTE_BULK": "0"
+    "SAILIR_SYM_FIRST": "1"
   },
   "env_set_perf": {
     "_why": "Speed only, results identical. Not guarded as semantics, but a wrong value is a ~20x cliff, so it is still recorded and pinned.",

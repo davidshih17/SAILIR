@@ -164,6 +164,21 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
 
             signal.signal(signal.SIGALRM, _sym_alarm)
             signal.alarm(_tl)
+        # NUMERATOR-DEGREE GATE. Checked BEFORE routing, so a skipped integral
+        # costs nothing -- unlike the time limit, which only bails after burning
+        # its full budget. Routing cost is bimodal and high-s is where the
+        # pathological tail lives, so without this every high-s worker pays up
+        # to the time limit before falling through. s is a PROXY, not the cause
+        # (measured: s=24 -> 1 term, s=16 -> 6,435, s=20 -> 1,315,600); what it
+        # buys is predictability, and everything sampled at s<=5 gave small
+        # rules. This gate used to live in the orchestrator, which pre-screened
+        # candidates before bulk routing; that block is gone, so it belongs here.
+        _ms = int(os.environ.get('SAILIR_ROUTE_MAX_S', '5'))
+        _s = -sum(x for x in I if x < 0)
+        if _ms >= 0 and _s > _ms:
+            print(f'[sym-first] s={_s} > {_ms} — skipping route, straight to '
+                  f'beam search', flush=True)
+            return
         # START MARKER. Every other sym-first line is printed AFTER the route
         # returns, so without this a worker stuck in the route logs NOTHING and
         # the silence is indistinguishable from a slow import, model load or
@@ -171,7 +186,7 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         # following [sym-first] line means the route is still running -- and if
         # the gap exceeds the limit, the limit is NOT working.
         print(f'[sym-first] routing {",".join(str(x) for x in I)} '
-              f'(limit {_tl}s) ...', flush=True)
+              f'(s={_s}, limit {_tl}s) ...', flush=True)
         try:
             rule = canonical_monolithic_rule(I)
         except TimeoutError:
@@ -185,6 +200,16 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         if rule is None:
             print(f'[sym-first] survivor after {el:.1f}s — proceeding to '
                   f'beam search', flush=True)
+            return
+        # OUTPUT SIZE CAP. A rule with more terms than this is expression
+        # GROWTH, not reduction -- an IBP reduction of the same integral emits a
+        # median of 6-8 terms, so the beam search is strictly better. Measured:
+        # one route produced 1,315,600 terms against a 714,538-term expression.
+        # Also previously enforced by the removed orchestrator block.
+        _mt = int(os.environ.get('SAILIR_ROUTE_MAX_TERMS', '200'))
+        if len(rule) > _mt:
+            print(f'[sym-first] rule has {len(rule)} terms > {_mt} — expression '
+                  f'growth, proceeding to beam search', flush=True)
             return
         k0 = tkey(I)
         # DESCENT IS MODULO THE TERMINAL SET, matching symmetry_rule. A term

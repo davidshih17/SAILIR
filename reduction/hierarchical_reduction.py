@@ -970,8 +970,6 @@ def main():
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
     straggler2_integrals = set()  # integrals that have hit the second-level escalation
-    sym_memo = {}                 # integral -> symmetry rule (or None); Design 1 routing
-    n_symmetry_routed = 0         # cumulative count of integrals routed free by symmetry
     if args.use_symmetry:
         # Compare against the STORE's own prod_point, not the literal 1009. The
         # requirement is that transform coefficients and IBP coefficients live
@@ -1201,115 +1199,6 @@ def main():
         # so this only adds cache entries -- apply_substitutions is unchanged.
         # Value-preserving: every rule is a GF(p) combination of exact symmetry
         # identities, so the final master combination is identical to the baseline.
-        if args.use_symmetry:
-            # The orchestrator no longer imports a router: routing runs ONLY in
-            # Condor workers. Binding one here invited it to be called
-            # in-process, which is what the fork-pool and serial tiers did
-            # before they were removed.
-            #
-            # NOTE the worker HARDCODES canonical_monolithic_rule
-            # (routing_closure_worker.py: `from symmetry_route import
-            # canonical_monolithic_rule as _route`). That matches what this
-            # function used to select under SAILIR_SECTOR_RANK=1 without
-            # --symmetry-staged -- the certified configuration -- but NOT the
-            # other two branches, so --symmetry-staged is rejected below rather
-            # than silently ignored.
-            _rt_limit = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
-            routed_this_iter = 0
-            while True:
-                cand = get_non_masters(expr) - set(cache.keys()) - set(pending.keys())
-                routed = 0
-                # Numerator-degree gate: skip routing above this s. Checked
-                # BEFORE _route, so a skipped integral costs nothing. s is a
-                # PROXY chosen for predictability -- everything sampled at s<=5
-                # gave small rules, while high s is bimodal (s=24 -> 1 term,
-                # s=20 -> 1,315,600). Skipped integrals go to worker dispatch.
-                _max_s = int(os.environ.get('SAILIR_ROUTE_MAX_S', '5'))
-                _skip_s = 0
-                _new_c = []
-                for I_ in cand:
-                    if I_ in sym_memo:
-                        continue
-                    if _max_s >= 0 and -sum(x for x in I_ if x < 0) > _max_s:
-                        sym_memo[I_] = None
-                        _skip_s += 1
-                        continue
-                    _new_c.append(I_)
-                if _skip_s:
-                    print(f"[route] skipped {_skip_s} integral(s) with "
-                          f"s>{_max_s} -> worker dispatch", flush=True)
-                # ROUTING ALWAYS GOES TO CONDOR. There is deliberately no
-                # in-process path: the orchestrator must dispatch, never compute.
-                #
-                # This used to fall back to a 16-core fork pool (>64 candidates)
-                # or a SERIAL loop (<=64), which meant the cheap-looking branches
-                # were taken exactly when the frontier had shrunk -- the later
-                # iterations -- and a single pathological integral then blocked
-                # the whole campaign inside the orchestrator process itself.
-                # Measured on the live pass: routing is bimodal to an extreme
-                # degree (median 1.2s, p90 3.2min, tail running 6.7h+), so ANY
-                # in-process routing is one bad integral away from a stall that
-                # also freezes submission, collection and bookkeeping.
-                #
-                # Condor per-integral jobs make the tail concurrent instead of
-                # blocking, and SAILIR_ROUTE_TIME_LIMIT bounds each one.
-                # BULK PRE-ROUTING IS OFF BY DEFAULT. It speculatively routes
-                # the ENTIRE frontier, but only integrals that actually get
-                # dispatched ever needed a route -- measured, one pass over
-                # 104,383 candidates cost ~5,700 CPU-hours across six hours of
-                # wall clock, and produced 104k output files, for work most of
-                # which the campaign never consumed.
-                #
-                # SAILIR_SYM_FIRST=1 instead melds routing into the worker
-                # (greedy_worker._sym_first): a dispatched worker tries the route
-                # on its own target before loading torch, returns steps=0 with
-                # method='symmetry' if it succeeds, and otherwise falls through
-                # to beam search. Same routing function, same per-integral cost,
-                # but paid ON DEMAND and only by jobs that were going to run
-                # anyway -- and a slow route stalls one worker instead of the
-                # orchestrator's submission/collection loop.
-                if _new_c and os.environ.get('SAILIR_ROUTE_BULK', '0') == '1':
-                    from routing_condor import route_batch_condor
-                    print(f"[route] {len(_new_c)} candidates -> Condor "
-                          f"(limit {_rt_limit}s/integral)", flush=True)
-                    sym_memo.update(route_batch_condor(
-                        _new_c, str(work_dir), f"i{iteration}"))
-                # EVERY CANDIDATE MUST END UP WITH AN ENTRY. The loop below does
-                # sym_memo[I] for every I in cand, so any candidate left without
-                # one is a KeyError that kills the orchestrator after the full
-                # cache load and substitution replay (~14 min to reproduce).
-                # Two ways that happens: bulk routing is disabled (the default --
-                # workers route themselves via SAILIR_SYM_FIRST), or it ran but
-                # returned nothing for some integral. Absent means NOT ROUTED,
-                # which is None: survivor -> worker dispatch.
-                for I_ in _new_c:
-                    sym_memo.setdefault(I_, None)
-                # SIZE CAP, same rule as routing_closure_worker: a route that
-                # produces more terms than this is expression GROWTH, not
-                # reduction (measured: s=20 -> 1,315,600 terms against a
-                # 714,538-term expression, 8 masters). Cap the OUTPUT, not s --
-                # the blowup is bimodal and not monotonic in s (s=24 -> 1 term,
-                # s=20 -> 1.3M). Over-cap integrals fall through to a worker.
-                _maxt = int(os.environ.get('SAILIR_ROUTE_MAX_TERMS', '200'))
-                _capped = 0
-                for I in cand:
-                    rule = sym_memo[I]
-                    if rule is not None and len(rule) > _maxt:
-                        sym_memo[I] = rule = None
-                        _capped += 1
-                    if rule is not None:            # {} (symmetry-zero) or strictly-lower rewrite
-                        cache[I] = rule; routed += 1
-                if not routed:
-                    break
-                routed_this_iter += routed
-                expr = apply_substitutions(expr, cache, args.prime)
-            if _capped:
-                print(f"  [route] capped {_capped} route(s) over {_maxt} terms "
-                      f"-> worker dispatch", flush=True)
-            if routed_this_iter:
-                n_symmetry_routed += routed_this_iter
-                print(f"{_iter_tag(iteration)} symmetry-routed {routed_this_iter} integrals free "
-                      f"({n_symmetry_routed} cumulative)", flush=True)
 
         # Count cache hits (integrals that were substituted)
         # This is approximate - we count how many integrals were removed
@@ -1829,7 +1718,11 @@ def main():
     print()
     print(f'Final expression: {len(masters)} masters, {len(non_masters)} non-masters')
     if args.use_symmetry:
-        print(f'Symmetry routing: {n_symmetry_routed} integrals reduced FREE (no worker); '
+        # The orchestrator does not route -- each worker does, via
+        # SAILIR_SYM_FIRST (greedy_worker._sym_first), and reports it per result
+        # as method='symmetry' with steps=0. Count those rather than a counter
+        # the orchestrator can no longer maintain.
+        print(f'Symmetry: routing runs in the workers (SAILIR_SYM_FIRST); '
               f'{total_jobs} worker jobs dispatched.')
 
     if non_masters:
@@ -1863,7 +1756,6 @@ def main():
         'final_expr': expr,
         'cache': cache,
         'total_jobs': total_jobs,
-        'n_symmetry_routed': n_symmetry_routed,
         'total_steps': total_steps,
         'elapsed_time': elapsed,
         'total_worker_time': total_worker_time,
