@@ -34,12 +34,23 @@ import topo_config as _tc
 P = _tc.canonicalize_module().P
 infile, outfile = sys.argv[1], sys.argv[2]
 
+# ACCEPT A LITERAL INTEGRAL, not just a batch file. At one integral per Condor
+# job a batch file is a one-line file per job -- 104k of them for a single
+# routing pass, all inodes and block slack for data that fits in argv. If argv[1]
+# parses as a comma-tuple and is not an existing path, take it directly.
 integrals = []
-with open(infile) as f:
-    for ln in f:
-        ln = ln.strip()
-        if ln:
-            integrals.append(tuple(int(x) for x in ln.split(",")))
+if not os.path.exists(infile) and ("," in infile or "_" in infile):
+    # UNDERSCORE is what routing_condor sends at BATCH=1: Condor's
+    # `queue bf,of from <file>` splits on commas, so a comma-tuple in argv is
+    # split across fields. Accept either so a hand-run with commas still works.
+    sep = "_" if "_" in infile else ","
+    integrals.append(tuple(int(x) for x in infile.split(sep)))
+else:
+    with open(infile) as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln:
+                integrals.append(tuple(int(x) for x in ln.split(",")))
 
 raw = {}
 # preload the orchestrator's persisted routing table (raw or composed rules —

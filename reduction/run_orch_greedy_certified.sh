@@ -77,6 +77,21 @@ export SAILIR_ROUTE_MAX_TERMS=200
 # integral costs nothing -- MAX_TERMS only rejects after the terms are built.
 # s is a proxy for predictability, not a cause; see greedy_certified.json.
 export SAILIR_ROUTE_MAX_S=5
+# The ONLY cap that acts DURING the expansion. MAX_TERMS rejects a rule after it
+# is built and MAX_S screens only the top integral, so without this a single
+# route can allocate millions of terms before anything stops it.
+export SAILIR_ROUTE_MAX_EXPAND=20000
+# ONE INTEGRAL PER CONDOR JOB. Routing cost is dominated by a small pathological
+# tail; at 100/job a single slow integral blocked its 99 healthy neighbours AND
+# withheld their results, because the worker writes its pkl only at the end --
+# measured, 40 minutes in, 1,044 jobs had produced 2 outputs while ~16,000
+# integrals were already routed but unwritten. Per-integral jobs make results
+# incremental and the tail isolated. Startup does not argue against it: the
+# worker needs only symmetry_route and a 200 KB store, measured at 0.02s.
+export SAILIR_ROUTE_BATCH=1
+# Drip-feed: 104k jobs in one condor_submit jams the schedd (PITFALL 11).
+export SAILIR_ROUTE_SUBMIT_CHUNK=5000
+export SAILIR_ROUTE_QUEUE_CEILING=8000
 
 export SAILIR_ROUTE_CONDOR=1
 export SAILIR_DELTA_SUBS=1
