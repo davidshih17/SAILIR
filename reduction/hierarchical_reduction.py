@@ -153,17 +153,31 @@ def apply_substitutions(expr, cache, prime, progress=0):
         for sub_int, sub_coeff in rule.items():
             if not sub_coeff:
                 continue
-            if _tkey(sub_int) <= kk:
+            # DESCENT IS MODULO THE TERMINAL SET. A master or corner needs no
+            # further reduction wherever it sits in the order, so a rule may
+            # legitimately emit one that is NOT lower -- symmetry_rule accepts
+            # exactly that (`tkey(k) > ki or _terminal(k)`). Demanding strict
+            # descent of EVERY term killed a resume on a real rule whose only
+            # offending term was the corner [1,0,1,1,0,0,1,1,0,1,...]
+            # (is_master=True, is_corner=True).
+            #
+            # Termination is unaffected: a terminal is never a cache key, so it
+            # is never enqueued. Only a NON-terminal that fails to descend could
+            # cycle, and that is a real bug in whatever produced the rule.
+            _lower = _tkey(sub_int) > kk
+            if not _lower and not is_master(sub_int):
                 raise AssertionError(
                     f"apply_substitutions: cache rule for {list(k)} emits "
-                    f"{list(sub_int)} which is NOT strictly lower in the order "
-                    f"(tkey {_tkey(sub_int)} <= {kk}). Substitution would not "
-                    f"terminate; this is a correctness bug in whatever produced "
-                    f"that rule.")
+                    f"{list(sub_int)}, which is NOT strictly lower in the order "
+                    f"AND NOT terminal (tkey {_tkey(sub_int)} <= {kk}). "
+                    f"Substitution would not terminate; this is a correctness "
+                    f"bug in whatever produced that rule.")
             v = (expr.get(sub_int, 0) + coeff * sub_coeff) % prime
             if v:
                 expr[sub_int] = v
-                if sub_int in cache and sub_int not in done:
+                # enqueue only strictly-descending terms; a terminal is never a
+                # cache key, and any other non-descending term raised above.
+                if _lower and sub_int in cache and sub_int not in done:
                     _push(sub_int)
             else:
                 expr.pop(sub_int, None)
