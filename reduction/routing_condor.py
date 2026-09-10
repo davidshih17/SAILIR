@@ -17,7 +17,17 @@ PYTHON = "/het/p4/dshih/jet_images-deep_learning/RL_MIR_IBP/conda_env/bin/python
 BATCH = 100
 
 
-def route_batch_condor(candidates, work_dir, tag, poll_s=10, timeout_s=3600):
+def route_batch_condor(candidates, work_dir, tag, poll_s=10, timeout_s=21600):
+    """Route `candidates` on Condor in 100-integral batches.
+
+    TIMEOUT SIZING. On expiry every batch without an output file is recomputed
+    SERIALLY IN-PROCESS, which is not a graceful degradation at this scale:
+    measured routing cost is ~10s/integral early in a batch and ~27s once the
+    per-worker cache has grown, so a single missing 100-integral batch is ~45
+    minutes of blocking serial work and 10% of 1,044 batches is ~100 hours.
+    The old 3600s default was set when batches were small; a 104,383-integral
+    pass needs hours, so the deadline must not be the thing that decides.
+    """
     rdir = os.path.join(work_dir, "routing")
     for sub in ("batches", "out", "logs"):
         os.makedirs(os.path.join(rdir, sub), exist_ok=True)
@@ -119,6 +129,11 @@ queue bf,of from {listf}
                 pass
         serial_fallback.append(bf)
     if serial_fallback:
+        print(f"[route-condor] WARNING: {len(serial_fallback)} batch(es) had no "
+              f"output after {time.time()-t0:.0f}s — recomputing "
+              f"~{len(serial_fallback)*BATCH} integrals SERIALLY in-process. "
+              f"At ~27s each this is ~{len(serial_fallback)*BATCH*27/3600:.1f}h "
+              f"and the orchestrator is BLOCKED throughout.", flush=True)
         import sys
         sys.path.insert(0, os.path.join(ROOT, "reduction"))
         from symmetry_route import canonical_monolithic_rule as _route
