@@ -137,14 +137,6 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         # Timing out is lossless: we simply fall through to that beam search,
         # exactly as for any integral symmetry cannot route.
         _tl = int(os.environ.get('SAILIR_ROUTE_TIME_LIMIT', '300'))
-        if _tl > 0:
-            import signal
-
-            def _sym_alarm(signum, frame):
-                raise TimeoutError('sym-first route exceeded the time limit')
-
-            signal.signal(signal.SIGALRM, _sym_alarm)
-            signal.alarm(_tl)
         # NUMERATOR-DEGREE GATE. Checked BEFORE routing, so a skipped integral
         # costs nothing -- unlike the time limit, which only bails after burning
         # its full budget. Routing cost is bimodal and high-s is where the
@@ -168,6 +160,30 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
         # the gap exceeds the limit, the limit is NOT working.
         print(f'[sym-first] routing {",".join(str(x) for x in I)} '
               f'(s={_s}, limit {_tl}s) ...', flush=True)
+        # ARM THE ALARM ONLY IMMEDIATELY BEFORE THE CALL IT BOUNDS, AND ALWAYS
+        # DISARM IT IN A finally.
+        #
+        # This previously armed the alarm above the numerator-degree gate, and
+        # that gate `return`s -- so every s>MAX_S worker walked out of sym-first
+        # with a LIVE 300s alarm, started the beam search, and was interrupted
+        # mid-search by SIGALRM raising TimeoutError from arbitrary code
+        # (observed inside np.take_along_axis in _tc_upenum_candidates). The
+        # worker died exit=1, wrote no result pkl, and its `pending` entry was
+        # therefore never collected or cleared -- so its concurrency slot was
+        # never returned. 610,012 frontier integrals are s>5, so this drained
+        # the orchestrator to available_slots = max_concurrent - 9,997 = 3 and
+        # the cluster fell to 26 running jobs.
+        #
+        # The handler is also RESTORED, not left installed: leaving it in place
+        # means any later SIGALRM in this process still raises TimeoutError out
+        # of unrelated code.
+        import signal
+        _prev_handler = None
+        if _tl > 0:
+            def _sym_alarm(signum, frame):
+                raise TimeoutError('sym-first route exceeded the time limit')
+            _prev_handler = signal.signal(signal.SIGALRM, _sym_alarm)
+            signal.alarm(_tl)
         try:
             rule = canonical_monolithic_rule(I)
         except TimeoutError:
@@ -175,8 +191,11 @@ if os.environ.get('SAILIR_SYM_FIRST', '0') == '1':
                   f'search', flush=True)
             return
         finally:
-            if _tl > 0:
-                signal.alarm(0)
+            # unconditional: cancel any pending alarm and put the previous
+            # handler back, on EVERY exit path including the returns above.
+            signal.alarm(0)
+            if _prev_handler is not None:
+                signal.signal(signal.SIGALRM, _prev_handler)
         el = time.time() - t0
         if rule is None:
             print(f'[sym-first] survivor after {el:.1f}s — proceeding to '
