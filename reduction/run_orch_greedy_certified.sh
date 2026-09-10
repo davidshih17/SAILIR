@@ -132,8 +132,15 @@ RESUME=${RESUME:-0}
 # including the iteration history and every divergence decision.
 LOG=$OUTDIR/logs/orch.log
 if [ "$RESUME" = "1" ]; then
-    n=1
-    while [ -e "$OUTDIR/logs/orch_resume$n.log" ]; do n=$((n+1)); done
+    # NUMBER FROM THE HIGHEST EVER USED, searching RECURSIVELY. Walking upward
+    # from 1 over the top level only re-issues a number as soon as an old log is
+    # filed into a subdirectory (e.g. logs/aborted_*/), so orch_resume7.log
+    # would be written a second time meaning something different. Nothing is
+    # overwritten -- the old file is elsewhere -- but the numbering stops being
+    # a history, which is the whole point of never reusing a name.
+    _hi=$(find "$OUTDIR/logs" -name 'orch_resume*.log' -printf '%f\n' 2>/dev/null \
+          | sed -n 's/^orch_resume\([0-9]\{1,\}\)\.log$/\1/p' | sort -n | tail -1)
+    n=$(( ${_hi:-0} + 1 ))
     LOG=$OUTDIR/logs/orch_resume$n.log
 fi
 
