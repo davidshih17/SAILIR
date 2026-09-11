@@ -52,6 +52,12 @@ from total_order import tkey as _tkey
 # site for the measurement that motivates it.
 _BOTTOM_UP = os.environ.get('SAILIR_BOTTOM_UP', '0') == '1'
 
+# Reconcile `pending` against Condor every N iterations. 0 disables. The grace
+# period must exceed one iteration so a job that finished just before the query
+# is never mistaken for one that vanished.
+_RECONCILE_EVERY = int(os.environ.get('SAILIR_RECONCILE_EVERY', '5'))
+_RECONCILE_GRACE = int(os.environ.get('SAILIR_RECONCILE_GRACE', '600'))
+
 REPO_DIR = Path(__file__).parent.parent.resolve()
 PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with SAILIR_PYTHON env var if Condor workers need a different interpreter
 
@@ -812,21 +818,82 @@ def query_job_start_times(cluster_ids):
         return {}
 
 
-def check_job_status(cluster_ids):
-    """Check status of Condor jobs. Returns set of completed cluster IDs."""
-    if not cluster_ids:
-        return set()
+def live_job_ids():
+    """Every job id currently in the queue, or None if the query failed.
 
+    Returns (procs, clusters): procs holds "cluster.proc" strings, clusters
+    holds bare "cluster" strings, because `pending` carries BOTH forms -- the
+    batch path stores f"{cluster}.{proc}" while the two straggler paths store a
+    bare cluster id from submit_condor_job().
+
+    None on failure is load-bearing: the caller must SKIP reconciliation rather
+    than treat "no output" as "no jobs", which would drop every pending entry
+    and re-dispatch the entire frontier.
+
+    One unfiltered query, not one per id -- passing thousands of ids on the
+    command line blows past ARG_MAX.
+    """
     try:
-        result = subprocess.run(
-            ['condor_q'] + list(cluster_ids) + ['-format', '%d\n', 'ClusterId'],
-            capture_output=True, text=True, timeout=30
-        )
-        running = set(result.stdout.strip().split('\n')) if result.stdout.strip() else set()
-        return set(cluster_ids) - running
+        r = subprocess.run(['condor_q', '-af', 'ClusterId', 'ProcId'],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return None
     except Exception as e:
-        print(f"Error checking job status: {e}")
-        return set()
+        print(f"  [reconcile] condor_q failed ({e}) -- skipping this pass",
+              flush=True)
+        return None
+    procs, clusters = set(), set()
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 2:
+            procs.add(f'{f[0]}.{f[1]}')
+            clusters.add(f[0])
+    return procs, clusters
+
+
+def reconcile_pending(pending, grace_seconds):
+    """Drop pending entries whose Condor job is gone and left no result.
+
+    WHY THIS EXISTS. `pending` was only ever cleared on result collection,
+    cancellation, or divergence. A job that vanishes any other way -- eviction,
+    hold, node failure, a kill from outside the memory watcher, a schedd purge
+    -- leaked its slot FOREVER, and its integral was never re-dispatched because
+    the orchestrator believed it was still running. Measured on one 17 h run:
+    5,496 of 10,000 slots held by jobs that did not exist, starving dispatch to
+    ~11 slots per iteration and abandoning 177 L7 integrals outright.
+
+    Two guards keep this from eating live work:
+      - GRACE: an entry younger than grace_seconds is never judged, so a job
+        that finished moments ago is not mistaken for one that vanished.
+      - RESULT FILE: an entry whose output file exists is left alone; it
+        finished and collection will pick it up.
+    """
+    if not pending:
+        return 0
+    live = live_job_ids()
+    if live is None:
+        return 0                      # query failed -- change nothing
+    procs, clusters = live
+    now = time.time()
+    lost = []
+    for integral, (jid, out_file, t_sub, _cpus) in pending.items():
+        if jid is None:               # dry-run placeholder
+            continue
+        if now - t_sub < grace_seconds:
+            continue
+        jid = str(jid)
+        alive = (jid in procs) if '.' in jid else (jid in clusters)
+        if alive:
+            continue
+        try:
+            if os.path.exists(out_file):
+                continue              # finished; collection will take it
+        except Exception:
+            continue
+        lost.append(integral)
+    for integral in lost:
+        del pending[integral]
+    return len(lost)
 
 
 def main():
@@ -1352,6 +1419,17 @@ def main():
                     del pending[integral]
                 print(f"{_iter_tag(iteration)} Cancelled {len(obsolete_integrals)} pending jobs "
                       f"(idle+running) whose integrals are no longer needed", flush=True)
+
+        # Return slots held by jobs that no longer exist. Runs BEFORE to_submit
+        # is computed so a reclaimed integral is re-dispatched this iteration.
+        if _RECONCILE_EVERY and iteration % _RECONCILE_EVERY == 0:
+            _t_rec = time.time()
+            _n_lost = reconcile_pending(pending, _RECONCILE_GRACE)
+            if _n_lost:
+                print(f"{_iter_tag(iteration)} [reconcile] reclaimed {_n_lost:,} "
+                      f"slots from jobs that vanished without a result "
+                      f"({len(pending):,} still pending, "
+                      f"{time.time()-_t_rec:.1f}s)", flush=True)
 
         # Find non-masters that need reduction
         non_masters = get_non_masters(expr)
