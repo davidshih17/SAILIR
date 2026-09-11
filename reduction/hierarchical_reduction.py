@@ -47,6 +47,7 @@ from beam_search_utils import get_sector_mask
 # Imported from there rather than from symmetry_route, which loads the transform
 # store at import time and would drag it into every run.
 from total_order import tkey as _tkey
+from total_order import is_zero_integral as _is_zero
 
 # Dispatch the LOWEST integrals first instead of the highest. See the dispatch
 # site for the measurement that motivates it.
@@ -132,7 +133,10 @@ def apply_substitutions(expr, cache, prime, progress=0,
     # state, which is far worse than a slow one. If a cache entry ever violates
     # descent, that is a CORRECTNESS bug elsewhere and must surface as an error,
     # not be absorbed by a cap -- hence the explicit check below.
-    expr = {k: v % prime for k, v in expr.items() if v % prime}
+    # Drop scaleless terms outright: they contribute nothing to the sum, so
+    # carrying them only grows the expression and the frontier.
+    expr = {k: v % prime for k, v in expr.items()
+            if v % prime and not _is_zero(k)}
     heap = []
     queued = set()
     done = set()
@@ -293,7 +297,10 @@ def _iter_tag(iteration):
 
 def get_non_masters(expr):
     """Get all non-master integrals in an expression."""
-    return {i for i, c in expr.items() if c != 0 and not is_master(i)}
+    # Scaleless (no-propagator) integrals are identically zero -- they are
+    # not work, and counting them as non-masters put 4,867 jobs in the queue.
+    return {i for i, c in expr.items()
+            if c != 0 and not is_master(i) and not _is_zero(i)}
 
 
 def coarse_weight(integral):

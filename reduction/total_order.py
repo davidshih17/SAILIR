@@ -64,3 +64,27 @@ def tkey(i):
 
 # Historical alias: the workers call it _target_key, the router calls it tkey.
 _target_key = tkey
+
+
+def is_zero_integral(i):
+    """True if `i` has NO propagator, hence is scaleless and identically zero.
+
+    Every denominator index <= 0 means no propagator is present at all, so the
+    integrand is a polynomial in the loop momenta -- scaleless, and zero in
+    dimensional regularisation. Confirmed empirically: the one such target a
+    pentagonbox campaign ever dispatched came back with an EMPTY expression
+    after 1 step, i.e. the IBP identities reduce it to nothing.
+
+    Nothing tested for this before, so such integrals were classified as
+    ordinary non-masters. Top-down dispatch never reached them; bottom-up walked
+    straight in -- 3,092 in the frontier and 4,867 queued Condor jobs, each
+    spending a worker to rediscover a fact this settles in a few comparisons.
+
+    Written as an early-exit loop, not sector_mask(i) == 0: this is called per
+    term over a 1.78M-term expression, and the common case (a propagator in the
+    first position or two) returns immediately.
+    """
+    for k in range(_N_DEN):
+        if i[k] > 0:
+            return False
+    return True
