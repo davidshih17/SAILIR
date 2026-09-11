@@ -41,12 +41,16 @@ import re as _re
 _DIVERGE_LINE = _re.compile(
     r'\[v6 step +(\d+)\].*?best mw=\((\d+), (\d+),.*?'
     r'nm=(\d+).*?rs_vsz=(\d+).*?t_total=([0-9.]+)')
-from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME
+from sailir.ibp_env import IBPEnvironment, set_prime, set_paper_masters_only, is_master, weight, PRIME, solve_ibp_for
 from beam_search_utils import get_sector_mask
 # The workers' total order -- ONE definition, reduction/total_order.py.
 # Imported from there rather than from symmetry_route, which loads the transform
 # store at import time and would drag it into every run.
 from total_order import tkey as _tkey
+
+# Dispatch the LOWEST integrals first instead of the highest. See the dispatch
+# site for the measurement that motivates it.
+_BOTTOM_UP = os.environ.get('SAILIR_BOTTOM_UP', '0') == '1'
 
 REPO_DIR = Path(__file__).parent.parent.resolve()
 PYTHON_PATH = os.environ.get("SAILIR_PYTHON", sys.executable)  # override with SAILIR_PYTHON env var if Condor workers need a different interpreter
@@ -1060,6 +1064,16 @@ def main():
 
     env = IBPEnvironment()
 
+    # Mined one-level reductions, consulted before spending a Condor slot.
+    # None (the default) means the campaign behaves exactly as it does today.
+    from recipe_index import load_if_configured as _load_recipe_index
+    recipe_index = _load_recipe_index()
+    if recipe_index is not None and not _BOTTOM_UP:
+        print('[recipe-index] WARNING: loaded but SAILIR_BOTTOM_UP is not set. '
+              'Mined reductions are for integrals ABOVE the walks that produced '
+              'them (99.4% measured), which a top-down sweep has already '
+              'retired -- expect almost no hits.', flush=True)
+
     # Parse starting integral
     starting_integral = tuple(int(x) for x in args.integral.split(','))
     print(f'Starting integral: I{list(starting_integral)}')
@@ -1351,6 +1365,28 @@ def main():
         if diverged:
             to_submit = to_submit - diverged
 
+        # Cash mined reductions BEFORE spending Condor slots on them. A hit is a
+        # worker job that never has to run. resolve() re-derives and re-verifies
+        # the reduction (0.22 ms measured); anything that fails verification
+        # returns None and the target is dispatched normally, so a stale or
+        # wrong index can only cost time, never correctness.
+        if recipe_index is not None and to_submit:
+            _budget = int(os.environ.get('SAILIR_RECIPE_PER_ITER', '20000'))
+            _ordered = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
+            _t_rec = time.time()
+            _cashed = 0
+            for _I in _ordered[:_budget]:
+                _rule = recipe_index.resolve(_I, env, is_master, _tkey,
+                                             solve_ibp_for)
+                if _rule is not None:
+                    cache[_I] = _rule
+                    to_submit.discard(_I)
+                    _cashed += 1
+            if _cashed:
+                print(f"  [recipe] cashed {_cashed:,} targets from the index in "
+                      f"{time.time()-_t_rec:.1f}s -- {len(to_submit):,} still "
+                      f"need workers", flush=True)
+
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
         if available_slots < len(to_submit):
@@ -1362,7 +1398,15 @@ def main():
             # first -- and then refines it with orbit grouping and the |abs|
             # tiebreak. Dispatching in the order the reduction actually descends
             # in beats a coarser restatement of it.
-            to_submit = sorted(to_submit, key=_tkey)
+            #
+            # BOTTOM-UP (SAILIR_BOTTOM_UP=1) reverses this: dispatch the LOWEST
+            # integrals first. Measured motivation -- of 25,177 reductions minable
+            # from worker walks, 25,034 (99.4%) are for integrals strictly ABOVE
+            # the walk's own target and 0 are below. Top-down retires those before
+            # the walk that would mine them, so they can never be cashed (0/5,000
+            # in the temporal holdout). Bottom-up is the only order in which a
+            # mined reduction lands on work not yet done.
+            to_submit = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
             to_submit = set(to_submit[:available_slots])
 
         # Submit new jobs: build the WHOLE iteration's batch, then ONE
