@@ -678,7 +678,13 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
     dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
     level = sum(get_sector_mask(integral))
     r, s = weight(integral)[:2]
-    job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
+    job_priority = level * 1_000_000 + r * 1000 + s
+    if _BOTTOM_UP:
+        # SECOND copy of the priority formula -- this is the one the BATCH
+        # submit path actually uses. Fixing only the other one left the live
+        # run still top-down (L4 at 4,004,007 idle behind L5 at 5,005,001).
+        job_priority = 20_000_000 - job_priority
+    job_priority += (50 if cpus > 1 else 0)
     if memory_gb is not None:
         if level >= 8:
             memory = memory_gb
