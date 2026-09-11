@@ -51,12 +51,14 @@ from total_order import is_zero_integral as _is_zero
 from total_order import tkey as _tk_unused  # noqa: F401  (tkey imported above)
 
 
-def _RANK_OF(integral):
-    """The total order's senior key for `integral`: its sector rank."""
-    return -_tkey(integral)[0] if _SECTOR_RANK else sum(get_sector_mask(integral))
+# TOTAL LEX RANK of each integral queued this iteration: its POSITION in the
+# tkey-sorted frontier. An integer Condor priority cannot hold tkey itself
+# (-rank, -r, -s, |abs|) -- |abs| is a 15-tuple -- but the position in the
+# sorted order carries the SAME ordering exactly, tiebreak included. Keying on
+# sector rank alone, or on the propagator count before that, are both
+# projections that collapse integrals the real order separates.
+_LEX_RANK = {}
 
-# Dispatch the LOWEST integrals first instead of the highest. See the dispatch
-# site for the measurement that motivates it.
 _BOTTOM_UP = os.environ.get('SAILIR_BOTTOM_UP', '0') == '1'
 _SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
 
@@ -457,26 +459,16 @@ def job_priority_for(integral, cpus):
     Stragglers (cpus > 1) get a small bonus so a promoted hard target stays
     ahead of equal-weight 1-CPU jobs.
     """
-    # Use the REAL order's senior key -- the SECTOR RANK -- not the propagator
-    # count. tkey = (-rank, -r, -s, |abs|) and smaller tkey means higher, so
-    # higher rank / higher r / higher s is earlier in a top-down sweep. Condor
-    # runs the highest priority first, so the base is monotone in exactly those.
-    #
-    # `level` (popcount) is only a coarse projection of rank: rank orders masks
-    # by popcount FIRST and then refines within it, so two integrals at the same
-    # level can sit far apart in the true order. It happened not to matter at L4
-    # here (ranks span only -175..-176) but it does at L6/L7, where rank varies
-    # across hundreds of values.
-    #
-    # The |abs| tiebreak cannot be carried: an integer priority cannot encode a
-    # 15-tuple without destroying the ordering. rank/r/s is the whole order down
-    # to that final tiebreak.
-    rank = _RANK_OF(integral)
-    r, s = weight(integral)[:2]
-    p = rank * 1_000_000 + r * 1000 + s
-    if _BOTTOM_UP:
-        p = 2_000_000_000 - p
-    return p + (50 if cpus > 1 else 0)
+    # Position in the tkey-sorted frontier -- the TOTAL LEX RANK, |abs| tiebreak
+    # included. Condor runs the highest priority first, so position 0 (the first
+    # integral in dispatch order) must get the largest number. The sort already
+    # honours _BOTTOM_UP, so nothing is inverted here.
+    pos = _LEX_RANK.get(integral)
+    if pos is None:
+        # Not in this iteration's ordered batch (straggler resubmit): fall back
+        # to the middle so it neither jumps the queue nor starves.
+        pos = len(_LEX_RANK) // 2
+    return (1_000_000_000 - pos) + (50 if cpus > 1 else 0)
 
 
 def create_condor_submit(work_dir, integral, job_name, output_file,
@@ -1586,6 +1578,14 @@ def main():
 
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
+
+        # ALWAYS order the frontier and record each integral's TOTAL LEX RANK --
+        # its position in the tkey order -- even when everything fits. The rank
+        # is the Condor priority, so skipping this when there is room left
+        # _LEX_RANK stale from a previous iteration and priorities wrong.
+        _ordered = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
+        _LEX_RANK.clear()
+        _LEX_RANK.update((I, n) for n, I in enumerate(_ordered))
         if available_slots < len(to_submit):
             # Prioritise by the REDUCTION ORDER itself: smaller tkey = higher
             # = eliminated first, so the most upstream integrals clear first.
@@ -1603,8 +1603,7 @@ def main():
             # the walk that would mine them, so they can never be cashed (0/5,000
             # in the temporal holdout). Bottom-up is the only order in which a
             # mined reduction lands on work not yet done.
-            to_submit = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
-            to_submit = set(to_submit[:available_slots])
+            to_submit = set(_ordered[:available_slots])
 
         # Submit new jobs: build the WHOLE iteration's batch, then ONE
         # condor_submit (one cluster, procs 0..N-1). This collapses a 75-job
