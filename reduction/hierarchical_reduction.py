@@ -210,6 +210,14 @@ def apply_substitutions(expr, cache, prime, progress=0,
         for sub_int, sub_coeff in rule.items():
             if not sub_coeff:
                 continue
+            # A term in a zero sector contributes nothing. Filtering only at
+            # fold ENTRY was not enough: substitutions re-introduce them, so the
+            # expression kept ~1.59M zero terms (|expr| 1,788,838 while only
+            # 200,019 were real work). Dropping them here keeps them out for
+            # good -- no jobs were ever dispatched for them either way, but they
+            # cost memory and get re-walked every iteration.
+            if _is_zero(sub_int):
+                continue
             # DESCENT IS MODULO THE TERMINAL SET. A master or corner needs no
             # further reduction wherever it sits in the order, so a rule may
             # legitimately emit one that is NOT lower -- symmetry_rule accepts
