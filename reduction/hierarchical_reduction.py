@@ -491,7 +491,18 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     # 1-CPU jobs.
     level = sum(get_sector_mask(integral))
     r, s = weight(integral)[:2]
-    job_priority = level * 1_000_000 + r * 1000 + s + (50 if cpus > 1 else 0)
+    job_priority = level * 1_000_000 + r * 1000 + s
+    if _BOTTOM_UP:
+        # Condor runs the HIGHEST priority first, so the top-down formula tells
+        # it to run high levels first -- the exact opposite of bottom-up
+        # dispatch. Leaving it unflipped makes bottom-up only half real: the
+        # orchestrator submits the lowest integrals, then the cluster runs the
+        # highest ones. Observed live: 4,106 L4 jobs idle at priority ~4,004,015
+        # while 526 L5 ran at ~5,006,002, with identical queue ages, and L4
+        # consumption was exactly ZERO while L5 manufactured 3.05 L4 children
+        # per completion.
+        job_priority = 20_000_000 - job_priority
+    job_priority += (50 if cpus > 1 else 0)
 
     # Memory: use explicit --worker-memory-gb as the L=8 (heaviest) request,
     # and scale DOWN for lower levels. Lower-level integrals have far smaller
