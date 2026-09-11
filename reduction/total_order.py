@@ -141,3 +141,41 @@ def is_zero_integral(i):
         if i[k] > 0:
             m |= 1 << k
     return bool(_ZERO_SECTORS[m])
+
+
+# Bits per field. |abs| components are 4 bits: the largest seen on the live
+# frontier is 14, and 0 of 103,875 sampled components exceeded 15.
+_B_RANK, _B_R, _B_S, _B_ABS = 10, 5, 5, 4
+_N_ABS_PACKED = 10          # 10 + 5 + 5 + 10*4 = 60 bits, inside HTCondor's 64
+_ABS_MAX = (1 << _B_ABS) - 1
+
+
+def tkey_packed(i):
+    """tkey as ONE integer, ordered so LARGER == HIGHER == eliminated first.
+
+    Derived from tkey() itself -- never from the integral -- so it cannot drift
+    from the order. Note the inversion: tkey is SMALLER = higher, this is LARGER
+    = higher, because HTCondor runs the highest priority first.
+
+    THE SIGNS, which are the whole difficulty (see the module docstring and
+    ORDERING.md). tkey = (-rank, -r, -s, |abs|):
+      - the first three are already NEGATED, so -tkey[k] recovers rank / r / s,
+        each of which is LARGER when higher. They pack ascending.
+      - |abs| is NOT negated: a SMALLER |abs| tuple is HIGHER. So it packs
+        COMPLEMENTED (_ABS_MAX - a), or the tail runs backwards. Getting exactly
+        this wrong ordered 16% of pairs incorrectly when measured.
+
+    Only the first _N_ABS_PACKED of the 15 |abs| components fit. Integrals
+    identical through those tie, and HTCondor breaks the tie arbitrarily. On the
+    live frontier this resolves 65% of integrals, against 0.3% when |abs| was
+    dropped entirely -- there, 7,326 integrals collapsed into 18 classes.
+    """
+    k = tkey(i)
+    v = -k[0]                                   # sector rank, ascending
+    v = (v << _B_R) | min(-k[1], (1 << _B_R) - 1)
+    v = (v << _B_S) | min(-k[2], (1 << _B_S) - 1)
+    a = k[3]
+    for j in range(_N_ABS_PACKED):
+        c = min(a[j], _ABS_MAX) if j < len(a) else 0
+        v = (v << _B_ABS) | (_ABS_MAX - c)      # COMPLEMENTED: smaller = higher
+    return v

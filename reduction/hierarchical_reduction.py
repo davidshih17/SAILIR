@@ -48,16 +48,23 @@ from beam_search_utils import get_sector_mask
 # store at import time and would drag it into every run.
 from total_order import tkey as _tkey
 from total_order import is_zero_integral as _is_zero
+from total_order import tkey_packed as _tkey_packed
+# Ceiling for the bottom-up flip; above any real key (60 bits used).
+_TKEY_PACKED_MAX = (1 << 61) - 1
 from total_order import tkey as _tk_unused  # noqa: F401  (tkey imported above)
 
 
-# TOTAL LEX RANK of each integral queued this iteration: its POSITION in the
-# tkey-sorted frontier. An integer Condor priority cannot hold tkey itself
-# (-rank, -r, -s, |abs|) -- |abs| is a 15-tuple -- but the position in the
-# sorted order carries the SAME ordering exactly, tiebreak included. Keying on
-# sector rank alone, or on the propagator count before that, are both
-# projections that collapse integrals the real order separates.
-_LEX_RANK = {}
+# The Condor priority must be a function of the INTEGRAL ALONE. Position in the
+# sorted frontier is not: the frontier shifts every iteration, so position 0
+# names a different integral each time, and Condor compares jobs queued minutes
+# apart against each other. An integral submitted late would outrank a strictly
+# lower one submitted early.
+#
+# tkey = (-rank, -r, -s, |abs|) cannot be packed exactly -- |abs| is 15
+# components, ~100 bits, and JobPrio is bounded (we already emit ~1.8e9 against
+# a 2^31 ceiling). So the key carries the order down to, but not including, the
+# |abs| tiebreak: integrals identical in (rank, r, s) tie, and Condor breaks
+# that tie arbitrarily. Everything coarser than |abs| is exact.
 
 _BOTTOM_UP = os.environ.get('SAILIR_BOTTOM_UP', '0') == '1'
 _SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
@@ -459,16 +466,13 @@ def job_priority_for(integral, cpus):
     Stragglers (cpus > 1) get a small bonus so a promoted hard target stays
     ahead of equal-weight 1-CPU jobs.
     """
-    # Position in the tkey-sorted frontier -- the TOTAL LEX RANK, |abs| tiebreak
-    # included. Condor runs the highest priority first, so position 0 (the first
-    # integral in dispatch order) must get the largest number. The sort already
-    # honours _BOTTOM_UP, so nothing is inverted here.
-    pos = _LEX_RANK.get(integral)
-    if pos is None:
-        # Not in this iteration's ordered batch (straggler resubmit): fall back
-        # to the middle so it neither jumps the queue nor starves.
-        pos = len(_LEX_RANK) // 2
-    return (1_000_000_000 - pos) + (50 if cpus > 1 else 0)
+    # total_order.tkey_packed IS the order, packed into one 64-bit integer:
+    # LARGER = higher = eliminated first, which is the direction HTCondor runs.
+    # Never re-derive it here -- that is how the order fragmented before.
+    p = _tkey_packed(integral)
+    if _BOTTOM_UP:
+        p = _TKEY_PACKED_MAX - p
+    return p + (50 if cpus > 1 else 0)
 
 
 def create_condor_submit(work_dir, integral, job_name, output_file,
@@ -1579,13 +1583,7 @@ def main():
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
 
-        # ALWAYS order the frontier and record each integral's TOTAL LEX RANK --
-        # its position in the tkey order -- even when everything fits. The rank
-        # is the Condor priority, so skipping this when there is room left
-        # _LEX_RANK stale from a previous iteration and priorities wrong.
         _ordered = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
-        _LEX_RANK.clear()
-        _LEX_RANK.update((I, n) for n, I in enumerate(_ordered))
         if available_slots < len(to_submit):
             # Prioritise by the REDUCTION ORDER itself: smaller tkey = higher
             # = eliminated first, so the most upstream integrals clear first.
