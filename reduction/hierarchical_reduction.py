@@ -436,6 +436,28 @@ def greedy_worker_args(topology_dir, integral_str, output_file,
             f'{paper_masters_flag}{resume_flag}')
 
 
+def job_priority_for(integral, cpus):
+    """THE Condor job priority. One definition -- never re-implemented.
+
+    Condor runs the HIGHEST priority first. The base formula orders TOP-DOWN
+    (high level first); under bottom-up dispatch it must be inverted, or the
+    orchestrator selects the lowest integrals and then tells the cluster to run
+    them last. That is not a hypothetical: this existed as TWO copies, one was
+    fixed and the other was not, and the live run stayed top-down -- 4,106 L4
+    jobs idle at 4,004,007 behind L5 running at 5,005,001, with L4 consumption
+    exactly ZERO while L5 emitted 3.05 L4 children per completion.
+
+    Stragglers (cpus > 1) get a small bonus so a promoted hard target stays
+    ahead of equal-weight 1-CPU jobs.
+    """
+    level = sum(get_sector_mask(integral))
+    r, s = weight(integral)[:2]
+    p = level * 1_000_000 + r * 1000 + s
+    if _BOTTOM_UP:
+        p = 20_000_000 - p
+    return p + (50 if cpus > 1 else 0)
+
+
 def create_condor_submit(work_dir, integral, job_name, output_file,
                          model_checkpoint, beam_width, max_steps, prime,
                          topology_dir,
@@ -489,20 +511,8 @@ def create_condor_submit(work_dir, integral, job_name, output_file,
     # clear before its L7 descendants can be finalized. Stragglers (cpus > 1)
     # get a small bonus so a promoted hard target stays ahead of equal-weight
     # 1-CPU jobs.
+    job_priority = job_priority_for(integral, cpus)
     level = sum(get_sector_mask(integral))
-    r, s = weight(integral)[:2]
-    job_priority = level * 1_000_000 + r * 1000 + s
-    if _BOTTOM_UP:
-        # Condor runs the HIGHEST priority first, so the top-down formula tells
-        # it to run high levels first -- the exact opposite of bottom-up
-        # dispatch. Leaving it unflipped makes bottom-up only half real: the
-        # orchestrator submits the lowest integrals, then the cluster runs the
-        # highest ones. Observed live: 4,106 L4 jobs idle at priority ~4,004,015
-        # while 526 L5 ran at ~5,006,002, with identical queue ages, and L4
-        # consumption was exactly ZERO while L5 manufactured 3.05 L4 children
-        # per completion.
-        job_priority = 20_000_000 - job_priority
-    job_priority += (50 if cpus > 1 else 0)
 
     # Memory: use explicit --worker-memory-gb as the L=8 (heaviest) request,
     # and scale DOWN for lower levels. Lower-level integrals have far smaller
@@ -677,14 +687,7 @@ def _compute_job_fields(integral, output_file, model_checkpoint, beam_width,
     resume_flag = f' --resume-from {resume_from}' if resume_from else ''
     dedup_flag = ' --dedup-beam-by-content' if dedup_beam_by_content else ''
     level = sum(get_sector_mask(integral))
-    r, s = weight(integral)[:2]
-    job_priority = level * 1_000_000 + r * 1000 + s
-    if _BOTTOM_UP:
-        # SECOND copy of the priority formula -- this is the one the BATCH
-        # submit path actually uses. Fixing only the other one left the live
-        # run still top-down (L4 at 4,004,007 idle behind L5 at 5,005,001).
-        job_priority = 20_000_000 - job_priority
-    job_priority += (50 if cpus > 1 else 0)
+    job_priority = job_priority_for(integral, cpus)
     if memory_gb is not None:
         if level >= 8:
             memory = memory_gb
