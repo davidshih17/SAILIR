@@ -48,10 +48,17 @@ from beam_search_utils import get_sector_mask
 # store at import time and would drag it into every run.
 from total_order import tkey as _tkey
 from total_order import is_zero_integral as _is_zero
+from total_order import tkey as _tk_unused  # noqa: F401  (tkey imported above)
+
+
+def _RANK_OF(integral):
+    """The total order's senior key for `integral`: its sector rank."""
+    return -_tkey(integral)[0] if _SECTOR_RANK else sum(get_sector_mask(integral))
 
 # Dispatch the LOWEST integrals first instead of the highest. See the dispatch
 # site for the measurement that motivates it.
 _BOTTOM_UP = os.environ.get('SAILIR_BOTTOM_UP', '0') == '1'
+_SECTOR_RANK = os.environ.get('SAILIR_SECTOR_RANK', '0') == '1'
 
 # Reconcile `pending` against Condor every N iterations. 0 disables. The grace
 # period must exceed one iteration so a job that finished just before the query
@@ -450,11 +457,25 @@ def job_priority_for(integral, cpus):
     Stragglers (cpus > 1) get a small bonus so a promoted hard target stays
     ahead of equal-weight 1-CPU jobs.
     """
-    level = sum(get_sector_mask(integral))
+    # Use the REAL order's senior key -- the SECTOR RANK -- not the propagator
+    # count. tkey = (-rank, -r, -s, |abs|) and smaller tkey means higher, so
+    # higher rank / higher r / higher s is earlier in a top-down sweep. Condor
+    # runs the highest priority first, so the base is monotone in exactly those.
+    #
+    # `level` (popcount) is only a coarse projection of rank: rank orders masks
+    # by popcount FIRST and then refines within it, so two integrals at the same
+    # level can sit far apart in the true order. It happened not to matter at L4
+    # here (ranks span only -175..-176) but it does at L6/L7, where rank varies
+    # across hundreds of values.
+    #
+    # The |abs| tiebreak cannot be carried: an integer priority cannot encode a
+    # 15-tuple without destroying the ordering. rank/r/s is the whole order down
+    # to that final tiebreak.
+    rank = _RANK_OF(integral)
     r, s = weight(integral)[:2]
-    p = level * 1_000_000 + r * 1000 + s
+    p = rank * 1_000_000 + r * 1000 + s
     if _BOTTOM_UP:
-        p = 20_000_000 - p
+        p = 2_000_000_000 - p
     return p + (50 if cpus > 1 else 0)
 
 
