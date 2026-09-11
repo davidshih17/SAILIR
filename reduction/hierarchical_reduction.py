@@ -1330,6 +1330,13 @@ def main():
                 continue
             if r.get('success'):
                 cache[integ] = r.get('final_expr', r.get('expr', {integ: 1}))
+                # The expanded cache persists through the SAME files as the
+                # regular one -- the worker writes both. Reading only
+                # final_expr here meant every restart discarded the live-mined
+                # half and re-derived it from the static snapshot.
+                if recipe_index is not None:
+                    for _X, _op, _sd in (r.get('recipes') or ()):
+                        recipe_index.add(tuple(_X), _op, tuple(_sd))
             else:
                 # Failed worker: identity cache so we don't re-try and loop.
                 cache[integ] = {integ: 1}
@@ -1378,6 +1385,9 @@ def main():
                     continue
                 if r.get('success'):
                     cache[integ] = r.get('final_expr', r.get('expr', {integ: 1}))
+                    if recipe_index is not None:
+                        for _X, _op, _sd in (r.get('recipes') or ()):
+                            recipe_index.add(tuple(_X), _op, tuple(_sd))
                 else:
                     cache[integ] = {integ: 1}
             print(f'[RESUME-FROM] Loaded {len(cache)} cache entries in '

@@ -246,6 +246,12 @@ def load_if_configured():
     return idx
 
 
+def _raw_unstripped(env, op, seed):
+    """The full IBP identity, with no strip threshold applied."""
+    from sailir.ibp_env import get_raw_equation
+    return get_raw_equation(env.ibp_t, env.li_t, op, seed)
+
+
 def mine_path(path, env, is_master, tkey, n_idx=N_IDX):
     """Mine a finished walk's trajectory into recipes: [(X, op, seed), ...].
 
@@ -262,7 +268,15 @@ def mine_path(path, env, is_master, tkey, n_idx=N_IDX):
     for tgt, op, delta in path:
         seed = tuple(tgt[i] + delta[i] for i in range(n_idx))
         try:
-            raw = env.get_raw_equation_cached(op, seed)
+            # UNSTRIPPED, deliberately. env.get_raw_equation_cached applies the
+            # worker's strip threshold, which deletes every term below the
+            # walk's start weight -- a short identity then collapses to <2 terms
+            # and is skipped. Measured: 2,689 of 3,000 walks (89.6%) mined
+            # NOTHING for that reason, all of them 1-step walks, which are the
+            # majority of the campaign. The orchestrator regenerates unstripped
+            # at resolve time, so mining stripped would also disagree with it.
+            # A fresh derivation is ~0.08 ms, so even an 87-step walk is ~7 ms.
+            raw = _raw_unstripped(env, op, seed)
         except Exception:
             continue
         if not raw or len(raw) < 2:
