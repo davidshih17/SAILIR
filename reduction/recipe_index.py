@@ -91,43 +91,75 @@ class RecipeIndex:
         v = self.vals[i]
         return int(v[0]), unpack(bytes(v[1:]))
 
-    def resolve(self, integral, env, is_master, tkey, solve_ibp_for):
-        """Regenerate and VERIFY the reduction. Returns a rule dict, or None.
+    def _reject(self, integral, why):
+        """A rejection is a DEFECT, not a statistic.
 
-        None means "dispatch this target normally" -- never a reason to fail the
-        run. Every rejection path is counted so a silently-useless index shows up
-        in the orchestrator's stats instead of just doing nothing.
+        Every recipe was verified legal when the index was built -- 0 illegal
+        out of 40,402,554 records. Regenerating the same (op, seed) in the same
+        environment must reproduce the same legal reduction. So a rejection can
+        only mean the index and this process disagree: different prime,
+        different master set, a different raw-equation strip threshold, or an
+        index built against another topology.
+
+        That is worth shouting about, because the quiet failure is worse than
+        the loud one -- every lookup rejects, the hit rate reads 0%, and the
+        cache looks merely useless instead of misconfigured. The first one
+        prints in full; after that it is counted, and the count being nonzero
+        at all is the alarm.
+        """
+        self.n_rejected += 1
+        if self.n_rejected == 1:
+            print(f"\n*** MINED CACHE MISMATCH: {why}\n"
+                  f"    integral I{list(integral)}\n"
+                  f"    This recipe verified when the index was built, so the "
+                  f"index does not match this process.\n"
+                  f"    Check SAILIR_PRIME, the master set "
+                  f"(paper-masters-only), the raw-equation strip threshold, "
+                  f"and the topology.\n"
+                  f"    Targets fall back to workers, so results stay correct "
+                  f"-- but the cache is not doing its job.\n", flush=True)
+        return None
+
+    def resolve(self, integral, env, is_master, tkey, solve_ibp_for):
+        """Regenerate and re-verify the reduction. Returns a rule dict, or None.
+
+        None on a MISS is the normal case: the integral is not in the index, so
+        it dispatches to a worker as usual. None after a HIT is a defect -- see
+        _reject.
         """
         self.n_lookup += 1
         got = self.get(integral)
         if got is None:
-            return None
+            return None                      # miss: normal, not counted as bad
         self.n_hit += 1
         op, seed = got
         try:
             raw = env.get_raw_equation_cached(op, seed)
-        except Exception:
-            self.n_rejected += 1
-            return None
-        if not raw or integral not in raw:
-            self.n_rejected += 1
-            return None
+        except Exception as e:
+            return self._reject(integral, f'get_raw_equation raised: {e}')
+        if not raw:
+            return self._reject(integral, 'identity regenerated EMPTY')
+        if integral not in raw:
+            return self._reject(
+                integral, 'the integral is absent from its own identity')
         # the recipe is only valid if `integral` really is this identity's
         # maximal element -- otherwise solving for it is not a reduction
         if min(raw, key=tkey) != integral:
-            self.n_rejected += 1
-            return None
+            return self._reject(
+                integral, 'the integral is no longer the identity\'s maximal '
+                          'element (total order or master set differs)')
         ki = tkey(integral)
         for k in raw:
             if k == integral:
                 continue
             if not (tkey(k) > ki or is_master(k)):
-                self.n_rejected += 1      # descent violated: would kill the fold
-                return None
+                return self._reject(
+                    integral, f'term I{list(k)} is neither lower nor a master '
+                              f'(descent would break the fold)')
         rule = solve_ibp_for(raw, integral)
         if not rule:
-            self.n_rejected += 1
-            return None
+            return self._reject(integral, 'solve_ibp_for returned nothing '
+                                          '(leading coefficient vanishes mod p)')
         self.n_verified += 1
         return rule
 

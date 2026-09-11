@@ -208,26 +208,26 @@ def apply_substitutions(expr, cache, prime, progress=0):
 _ITER_CLOCK = {'n': None, 't': None}
 
 
-def _health_str(recipe_index, tot_recipe_cashed, tot_reclaimed):
-    """How often the mined cache actually answers, on every status line.
+def _health_str(recipe_index, mined_keys, mined_hits):
+    """The MINED cache reported apart from the worker-built cache.
 
-    Slot reconciliation is deliberately NOT reported here -- it is plumbing that
-    should simply work, and it still prints a line on any pass that reclaims.
+    Both live in the same dict because the fold must treat them identically, but
+    conflating them would hide the only question that matters about mining:
+    does it contribute reductions the campaign actually uses? So `Cache`/`Hits`
+    count worker-built rules only, and `MinedCache`/`MinedHits` count the ones
+    that came from the index.
 
-    What matters for the mined cache is the HIT RATE, so both halves of the
-    fraction are shown: how many integrals were looked up, and how many the
-    cache could answer. A rate that is flat zero means the cache does not hold
-    the integrals this campaign needs; a rate that is nonzero but with a large
-    `bad` count means it holds them but the reductions no longer verify.
+    Mismatches should be IMPOSSIBLE -- every recipe verified at build time -- so
+    any nonzero count is flagged as an alarm rather than reported as a statistic.
     """
     if recipe_index is None:
         return ''
     look = recipe_index.n_lookup
-    pct = (100.0 * tot_recipe_cashed / look) if look else 0.0
-    out = (f" | MinedCache: {tot_recipe_cashed:,} solved of {look:,} "
-           f"looked up ({pct:.2f}%)")
+    pct = (100.0 * len(mined_keys) / look) if look else 0.0
+    out = (f" | MinedCache: {len(mined_keys):,} of {look:,} looked up "
+           f"({pct:.2f}%) | MinedHits: {mined_hits:,}")
     if recipe_index.n_rejected:
-        out += f", {recipe_index.n_rejected:,} bad"
+        out += f"  *** {recipe_index.n_rejected:,} MISMATCHES ***"
     return out
 
 
@@ -1387,6 +1387,13 @@ def main():
     total_steps = 0
     total_worker_time = 0.0  # Cumulative worker runtime (excludes queue wait)
     cache_hits = 0
+    # Rules that came from the MINED index rather than from a worker. Kept as a
+    # separate key set so both the size and the hit count can be reported apart
+    # from the worker-built cache -- they live in the same dict because the fold
+    # must treat them identically, but they are not the same thing and mixing
+    # them would hide whether mining contributes anything.
+    mined_keys = set()
+    mined_hits = 0
     stragglers_resubmitted = 0
     max_worker_memory_kb = 0  # Peak raw memory across all workers
     max_worker_memory_per_cpu_kb = 0  # Peak per-CPU memory
@@ -1484,6 +1491,7 @@ def main():
                                              solve_ibp_for)
                 if _rule is not None:
                     cache[_I] = _rule
+                    mined_keys.add(_I)
                     to_submit.discard(_I)
                     _cashed += 1
             tot_recipe_cashed += _cashed
@@ -1863,7 +1871,13 @@ def main():
                         # Membership testing the ~18 new terms against the dict is
                         # the same answer in O(18) instead of O(|cache|).
                         new_non_masters = get_non_masters(result_expr)
-                        cached_count = sum(1 for k in new_non_masters if k in cache)
+                        cached_count = 0
+                        for k in new_non_masters:
+                            if k in cache:
+                                if k in mined_keys:
+                                    mined_hits += 1
+                                else:
+                                    cached_count += 1
                         cache_hits += cached_count
 
                         # Propagate depth and parent to newly discovered children
@@ -1957,13 +1971,17 @@ def main():
             print(f"{_iter_tag(iteration)} {masters_count} masters, {non_masters_count} non-masters | "
                   f"frontier=(L={frontier[0]},r={frontier[1]},s={frontier[2]}) x {n_at_frontier} | "
                   f"work={work} ({eta_str}) | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}"
+                  f"Pending: {len(pending)} | Cache: {len(cache) - len(mined_keys)} | "
+                  f"Hits: {cache_hits}"
+                  f"{_health_str(recipe_index, mined_keys, mined_hits)}"
                   f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
             print(f"           [hist] {hist_str}")
             print(f"           [maxw] {maxw_str}")
         else:
             print(f"{_iter_tag(iteration)} {masters_count} masters, 0 non-masters | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}"
+                  f"Pending: {len(pending)} | Cache: {len(cache) - len(mined_keys)} | "
+                  f"Hits: {cache_hits}"
+                  f"{_health_str(recipe_index, mined_keys, mined_hits)}"
                   f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
 
     # Final substitution
