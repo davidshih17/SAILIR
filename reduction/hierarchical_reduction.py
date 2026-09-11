@@ -67,11 +67,24 @@ def integral_to_str(integral):
     return '_'.join(str(x) for x in integral)
 
 
-def apply_substitutions(expr, cache, prime, progress=0):
+def apply_substitutions(expr, cache, prime, progress=0,
+                        recipe_index=None, mined_keys=None, env=None):
     """Apply all cached substitutions to an expression until no more apply.
 
     This recursively substitutes any integral that's in the cache with its
     reduced form, until only masters and un-cached integrals remain.
+
+    THE MINED INDEX IS A CACHE, NOT A SIDE-CHANNEL. If `recipe_index` is given
+    it is consulted wherever `cache` is -- seeding the worklist, looking up a
+    popped term, and deciding whether a newly-introduced term is substitutable.
+    A mined rule that verifies is written straight into `cache`, so from that
+    moment it is indistinguishable from a worker-built rule: same descent check,
+    same heap, same termination argument. `mined_keys` only records WHERE it came
+    from, for reporting.
+
+    Consulting it only at dispatch (as the first version did) could never hit:
+    dispatch asks about FRONTIER integrals, while mining yields integrals ABOVE
+    the frontier -- and those appear here, in the expression, not there.
     """
     # WORKLIST, NOT REBUILD-UNTIL-FIXPOINT. The previous implementation looped
     # `while changed`, and each pass copied EVERY term of the expression into a
@@ -130,8 +143,38 @@ def apply_substitutions(expr, cache, prime, progress=0):
         queued.add(k)
         heapq.heappush(heap, (_tkey(k), k))     # min-heap: smallest tkey first
 
-    for k in expr:
+    _has_idx = recipe_index is not None and env is not None
+    # ONE vectorised membership test for the whole expression (2.23s at 1.78M
+    # terms measured) instead of a Python lookup per term (~9s). The result is
+    # DEFINITIVE for these keys, so seeding must NOT fall back to a per-key
+    # get() -- that would re-ask the same 1.78M questions one at a time.
+    _idx_present = recipe_index.filter_present(expr.keys()) if _has_idx else set()
+
+    def _seed_substitutable(k):
+        return k in cache or k in _idx_present
+
+    def _substitutable(k):
+        # For terms INTRODUCED by a rule, which were not in the vectorised pass.
+        # Bounded by substitutions actually performed, not by |expr|.
         if k in cache:
+            return True
+        if not _has_idx:
+            return False
+        return k in _idx_present or recipe_index.get(k) is not None
+
+    def _rule_for(k):
+        rule = cache.get(k)
+        if rule is not None or not _has_idx:
+            return rule
+        rule = recipe_index.resolve(k, env, is_master, _tkey, solve_ibp_for)
+        if rule is not None:
+            cache[k] = rule                 # promoted: now an ordinary entry
+            if mined_keys is not None:
+                mined_keys.add(k)
+        return rule
+
+    for k in expr:
+        if _seed_substitutable(k):
             _push(k)
 
     t_fold = time.time()
@@ -144,7 +187,7 @@ def apply_substitutions(expr, cache, prime, progress=0):
         if progress and n_pop % progress == 0:
             print(f"    [fold] {n_pop:,} substituted, {len(heap):,} queued, "
                   f"|expr|={len(expr):,}, {time.time()-t_fold:.0f}s", flush=True)
-        rule = cache.get(k)
+        rule = _rule_for(k)
         if rule is None:
             continue
         coeff = expr.pop(k, 0)
@@ -187,7 +230,7 @@ def apply_substitutions(expr, cache, prime, progress=0):
                 expr[sub_int] = v
                 # enqueue only strictly-descending terms; a terminal is never a
                 # cache key, and any other non-descending term raised above.
-                if _lower and sub_int in cache and sub_int not in done:
+                if _lower and sub_int not in done and _substitutable(sub_int):
                     _push(sub_int)
             else:
                 expr.pop(sub_int, None)
@@ -208,24 +251,17 @@ def apply_substitutions(expr, cache, prime, progress=0):
 _ITER_CLOCK = {'n': None, 't': None}
 
 
-def _health_str(recipe_index, mined_keys, mined_hits):
-    """The MINED cache reported apart from the worker-built cache.
+def _health_str(recipe_index, mined_keys):
+    """Mined cache: its SIZE, and how many of its entries were actually used.
 
-    Both live in the same dict because the fold must treat them identically, but
-    conflating them would hide the only question that matters about mining:
-    does it contribute reductions the campaign actually uses? So `Cache`/`Hits`
-    count worker-built rules only, and `MinedCache`/`MinedHits` count the ones
-    that came from the index.
-
-    Mismatches should be IMPOSSIBLE -- every recipe verified at build time -- so
-    any nonzero count is flagged as an alarm rather than reported as a statistic.
+    Mirrors Cache/Hits for the worker-built cache. Size grows as new worker
+    trajectories are mined; hits is the number of mined rules the rewrite has
+    pulled into the expression.
     """
     if recipe_index is None:
         return ''
-    look = recipe_index.n_lookup
-    pct = (100.0 * len(mined_keys) / look) if look else 0.0
-    out = (f" | MinedCache: {len(mined_keys):,} of {look:,} looked up "
-           f"({pct:.2f}%) | MinedHits: {mined_hits:,}")
+    out = (f" | MinedCache: {len(recipe_index):,}"
+           f" | MinedHits: {len(mined_keys):,}")
     if recipe_index.n_rejected:
         out += f"  *** {recipe_index.n_rejected:,} MISMATCHES ***"
     return out
@@ -1158,6 +1194,12 @@ def main():
     # None (the default) means the campaign behaves exactly as it does today.
     from recipe_index import load_if_configured as _load_recipe_index
     recipe_index = _load_recipe_index()
+    # Rules that came from the MINED index rather than from a worker. Kept as a
+    # separate key set so both the size and the hit count can be reported apart
+    # from the worker-built cache -- they live in the same dict because the fold
+    # must treat them identically, but they are not the same thing and mixing
+    # them would hide whether mining contributes anything.
+    mined_keys = set()
     if recipe_index is not None and not _BOTTOM_UP:
         print('[recipe-index] WARNING: loaded but SAILIR_BOTTOM_UP is not set. '
               'Mined reductions are for integrals ABOVE the walks that produced '
@@ -1174,7 +1216,6 @@ def main():
     expr = {starting_integral: 1}  # Current expression (linear combo of integrals)
     cache = {}  # integral -> reduced expression (memoization)
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
-    tot_recipe_cashed = 0   # cumulative index hits turned into cache rules
     tot_reclaimed = 0       # cumulative slots returned by reconciliation
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
     straggler2_integrals = set()  # integrals that have hit the second-level escalation
@@ -1299,7 +1340,9 @@ def main():
               f'in {time.time()-t_resume:.1f}s', flush=True)
         # Apply all cached substitutions to start_expr to recover current state.
         t_apply = time.time()
-        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000,
+                                   recipe_index=recipe_index,
+                                   mined_keys=mined_keys, env=env)
         print(f'[RESUME] Applied substitutions to expr in {time.time()-t_apply:.1f}s; '
               f'|expr|={len(expr)}, |cache|={len(cache)}', flush=True)
 
@@ -1339,7 +1382,9 @@ def main():
                     cache[integ] = {integ: 1}
             print(f'[RESUME-FROM] Loaded {len(cache)} cache entries in '
                   f'{time.time()-t_rf:.1f}s', flush=True)
-        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000,
+                                   recipe_index=recipe_index,
+                                   mined_keys=mined_keys, env=env)
 
     # --reduce-only: restrict this round to a target list by DROPPING those
     # integrals from the (resumed) cache so they re-submit. Seed expr from the
@@ -1365,7 +1410,9 @@ def main():
                     targets.append(tuple(int(x) for x in line.split(',')))
         for ig in targets:
             cache.pop(ig, None)
-        expr = apply_substitutions({starting_integral: 1}, cache, args.prime)
+        expr = apply_substitutions({starting_integral: 1}, cache, args.prime,
+                                   recipe_index=recipe_index,
+                                   mined_keys=mined_keys, env=env)
         n_nm_seed = len(get_non_masters(expr))
         print(f'[REDUCE-ONLY] {len(targets)} targets dropped from cache; expr '
               f'seeded from REAL start replay (true coefficients); '
@@ -1387,13 +1434,6 @@ def main():
     total_steps = 0
     total_worker_time = 0.0  # Cumulative worker runtime (excludes queue wait)
     cache_hits = 0
-    # Rules that came from the MINED index rather than from a worker. Kept as a
-    # separate key set so both the size and the hit count can be reported apart
-    # from the worker-built cache -- they live in the same dict because the fold
-    # must treat them identically, but they are not the same thing and mixing
-    # them would hide whether mining contributes anything.
-    mined_keys = set()
-    mined_hits = 0
     stragglers_resubmitted = 0
     max_worker_memory_kb = 0  # Peak raw memory across all workers
     max_worker_memory_per_cpu_kb = 0  # Peak per-CPU memory
@@ -1405,7 +1445,9 @@ def main():
 
         # Apply all cached substitutions to the expression
         old_size = len(expr)
-        expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
+        expr = apply_substitutions(expr, cache, args.prime, progress=100_000,
+                                   recipe_index=recipe_index,
+                                   mined_keys=mined_keys, env=env)
 
         # DESIGN 1 symmetry routing: reduce every symmetry-reducible non-master for
         # FREE (strictly-lowering rewrite -> cache, no worker) and cascade the
@@ -1475,30 +1517,6 @@ def main():
         # kill/resubmit loop.
         if diverged:
             to_submit = to_submit - diverged
-
-        # Cash mined reductions BEFORE spending Condor slots on them. A hit is a
-        # worker job that never has to run. resolve() re-derives and re-verifies
-        # the reduction (0.22 ms measured); anything that fails verification
-        # returns None and the target is dispatched normally, so a stale or
-        # wrong index can only cost time, never correctness.
-        if recipe_index is not None and to_submit:
-            _budget = int(os.environ.get('SAILIR_RECIPE_PER_ITER', '20000'))
-            _ordered = sorted(to_submit, key=_tkey, reverse=_BOTTOM_UP)
-            _t_rec = time.time()
-            _cashed = 0
-            for _I in _ordered[:_budget]:
-                _rule = recipe_index.resolve(_I, env, is_master, _tkey,
-                                             solve_ibp_for)
-                if _rule is not None:
-                    cache[_I] = _rule
-                    mined_keys.add(_I)
-                    to_submit.discard(_I)
-                    _cashed += 1
-            tot_recipe_cashed += _cashed
-            print(f"  [mined-cache] looked up {len(_ordered[:_budget]):,} integrals, "
-                  f"solved {_cashed:,} without a job "
-                  f"({time.time()-_t_rec:.1f}s); {len(to_submit):,} still need workers",
-                  flush=True)
 
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)
@@ -1870,14 +1888,23 @@ def main():
                         # spent collecting while the Condor queue sat empty.
                         # Membership testing the ~18 new terms against the dict is
                         # the same answer in O(18) instead of O(|cache|).
+                        # Ingest the recipes this worker mined from its own
+                        # walk. This is what makes MinedCache GROW: every newly
+                        # reduced integral contributes the reductions its walk
+                        # passed through, for the cost of a dict insert here.
+                        if recipe_index is not None:
+                            for _X, _op, _sd in (result.get('recipes') or ()):
+                                recipe_index.add(tuple(_X), _op, tuple(_sd))
+
                         new_non_masters = get_non_masters(result_expr)
+                        # Hits counts WORKER-BUILT rules only. Mined rules live in
+                        # the same dict, so counting them here too would inflate
+                        # Hits with entries already reported under MinedCache --
+                        # the two columns must be completely disjoint.
                         cached_count = 0
                         for k in new_non_masters:
-                            if k in cache:
-                                if k in mined_keys:
-                                    mined_hits += 1
-                                else:
-                                    cached_count += 1
+                            if k in cache and k not in mined_keys:
+                                cached_count += 1
                         cache_hits += cached_count
 
                         # Propagate depth and parent to newly discovered children
@@ -1973,19 +2000,19 @@ def main():
                   f"work={work} ({eta_str}) | "
                   f"Pending: {len(pending)} | Cache: {len(cache) - len(mined_keys)} | "
                   f"Hits: {cache_hits}"
-                  f"{_health_str(recipe_index, mined_keys, mined_hits)}"
-                  f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
+                  f"{_health_str(recipe_index, mined_keys)}")
             print(f"           [hist] {hist_str}")
             print(f"           [maxw] {maxw_str}")
         else:
             print(f"{_iter_tag(iteration)} {masters_count} masters, 0 non-masters | "
                   f"Pending: {len(pending)} | Cache: {len(cache) - len(mined_keys)} | "
                   f"Hits: {cache_hits}"
-                  f"{_health_str(recipe_index, mined_keys, mined_hits)}"
-                  f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
+                  f"{_health_str(recipe_index, mined_keys)}")
 
     # Final substitution
-    expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
+    expr = apply_substitutions(expr, cache, args.prime, progress=100_000,
+                                   recipe_index=recipe_index,
+                                   mined_keys=mined_keys, env=env)
 
     # Final report
     elapsed = time.time() - start_time

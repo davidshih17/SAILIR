@@ -70,16 +70,42 @@ class RecipeIndex:
                     f'{path}: keys are not in byte-lexicographic order '
                     f'({bad:,} inversions). Binary search would miss every '
                     f'lookup. Rebuild the index with the current merge.')
+        # Newly mined recipes, appended live as workers finish. The sorted
+        # array is immutable (searchsorted needs it that way), so growth goes
+        # into a dict consulted alongside it. len() covers both, so MinedCache
+        # grows with every newly reduced integral.
+        self.extra = {}
         self.n_lookup = 0        # integrals ASKED about -- the denominator
         self.n_hit = 0
         self.n_verified = 0
         self.n_rejected = 0
 
     def __len__(self):
-        return len(self.keys)
+        return len(self.keys) + len(self.extra)
+
+    def add(self, X, op, seed):
+        """Append one mined recipe. Returns True if it is new."""
+        if X in self.extra:
+            return False
+        if self._in_array(X):
+            return False
+        self.extra[X] = (op, seed)
+        return True
+
+    def _in_array(self, integral):
+        try:
+            k = np.frombuffer(pack(integral), dtype=np.uint8).view(
+                np.dtype((np.void, N_IDX)))[0]
+        except (ValueError, TypeError):
+            return False
+        i = np.searchsorted(self._flat, k)
+        return i < len(self._flat) and self._flat[i] == k
 
     def get(self, integral):
-        """Return (op, seed) for `integral`, or None."""
+        """Return (op, seed) for `integral`, or None. Checks live entries too."""
+        got = self.extra.get(integral)
+        if got is not None:
+            return got
         try:
             k = np.frombuffer(pack(integral), dtype=np.uint8).view(
                 np.dtype((np.void, N_IDX)))[0]
@@ -119,6 +145,31 @@ class RecipeIndex:
                   f"    Targets fall back to workers, so results stay correct "
                   f"-- but the cache is not doing its job.\n", flush=True)
         return None
+
+    def filter_present(self, integrals):
+        """Which of `integrals` are in the index -- ONE vectorised search.
+
+        The fold asks this of every term in the expression, so it must not be a
+        per-key Python call: at 1.78M terms that is ~5 us each. Even packing in
+        a Python loop costs 5.09 s measured; letting numpy convert the list of
+        tuples to a 2-D array in C and doing a single searchsorted is 2.23 s for
+        a bit-identical answer.
+        """
+        keys = integrals if isinstance(integrals, list) else list(integrals)
+        if not keys:
+            return set()
+        a = np.array(keys, dtype=np.int16)        # list -> (n,15) array, in C
+        a += OFF
+        ok = ((a >= 0) & (a <= 255)).all(axis=1)  # unpackable components
+        buf = np.ascontiguousarray(a.astype(np.uint8))
+        flat = buf.view(np.dtype((np.void, N_IDX))).ravel()
+        pos = np.searchsorted(self._flat, flat)
+        np.clip(pos, 0, len(self._flat) - 1, out=pos)
+        hit = ok & (self._flat[pos] == flat)
+        found = {keys[j] for j in np.nonzero(hit)[0]}
+        if self.extra:
+            found.update(k for k in keys if k in self.extra)
+        return found
 
     def resolve(self, integral, env, is_master, tkey, solve_ibp_for):
         """Regenerate and re-verify the reduction. Returns a rule dict, or None.
@@ -193,3 +244,39 @@ def load_if_configured():
           f"({(idx.keys.nbytes + idx.vals.nbytes) / 1e6:.0f} MB resident)",
           flush=True)
     return idx
+
+
+def mine_path(path, env, is_master, tkey, n_idx=N_IDX):
+    """Mine a finished walk's trajectory into recipes: [(X, op, seed), ...].
+
+    Called in the WORKER, where every raw equation the walk used is already in
+    env._raw_eq_cache -- so this is a few hundred cached lookups, ~7 ms, against
+    a job that ran for minutes. Doing it in the orchestrator instead would mean
+    re-deriving ~87 identities for each of ~7,400 results per iteration, ~51 s
+    of serial work per iteration.
+
+    X is the identity's maximal element (argmin tkey). Legality can only fail on
+    an exact tie, since X is the minimum, so only ties are tested.
+    """
+    out = []
+    for tgt, op, delta in path:
+        seed = tuple(tgt[i] + delta[i] for i in range(n_idx))
+        try:
+            raw = env.get_raw_equation_cached(op, seed)
+        except Exception:
+            continue
+        if not raw or len(raw) < 2:
+            continue
+        best_t = None
+        best_k = None
+        tied = None
+        for k in raw:
+            t = tkey(k)
+            if best_t is None or t < best_t:
+                best_t = t; best_k = k; tied = None
+            elif t == best_t:
+                tied = k
+        if tied is not None and not is_master(tied):
+            continue
+        out.append((best_k, op, seed))
+    return out

@@ -543,11 +543,27 @@ def main():
 
     peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
+    # MINE THIS WALK. Every step used an exact IBP identity; solving each for
+    # its maximal element is a valid one-level reduction of an integral ABOVE
+    # this target -- work already paid for, thrown away until now. Done HERE
+    # because env._raw_eq_cache already holds every identity this search used,
+    # so it is a few hundred cached lookups against a job that ran for minutes.
+    # In the orchestrator it would be ~87 re-derivations x ~7,400 results per
+    # iteration instead.
+    recipes = []
+    try:
+        from recipe_index import mine_path
+        from total_order import tkey as _tk
+        recipes = mine_path(path, env, ibp_env.is_master, _tk)
+    except Exception as _e:
+        print(f'[mine] skipped: {_e}', flush=True)
+
     result = {
         'success': success,
         'original_integral': start_int,
         'final_expr': full_expr,
         'path': path,
+        'recipes': recipes,
         'restart_offsets': [],
         'steps': n_steps,
         'time': elapsed,
