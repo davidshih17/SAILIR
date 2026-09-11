@@ -209,19 +209,25 @@ _ITER_CLOCK = {'n': None, 't': None}
 
 
 def _health_str(recipe_index, tot_recipe_cashed, tot_reclaimed):
-    """Always-on counters for the two mechanisms that are otherwise SILENT.
+    """How often the mined cache actually answers, on every status line.
 
-    A mechanism that only logs when it does something is indistinguishable from
-    one that is not running at all -- the failure mode is a quiet zero that
-    reads as success. Reconciliation always shows its running total; the recipe
-    index shows hits/verified/rejected whenever it is loaded, so a 0% hit rate
-    is visible as 0% rather than as absence.
+    Slot reconciliation is deliberately NOT reported here -- it is plumbing that
+    should simply work, and it still prints a line on any pass that reclaims.
+
+    What matters for the mined cache is the HIT RATE, so both halves of the
+    fraction are shown: how many integrals were looked up, and how many the
+    cache could answer. A rate that is flat zero means the cache does not hold
+    the integrals this campaign needs; a rate that is nonzero but with a large
+    `bad` count means it holds them but the reductions no longer verify.
     """
-    out = f" | Reclaimed: {tot_reclaimed}"
-    if recipe_index is not None:
-        out += (f" | Recipe: {tot_recipe_cashed} cashed"
-                f" ({recipe_index.n_hit} hit/{recipe_index.n_verified} ok"
-                f"/{recipe_index.n_rejected} rej)")
+    if recipe_index is None:
+        return ''
+    look = recipe_index.n_lookup
+    pct = (100.0 * tot_recipe_cashed / look) if look else 0.0
+    out = (f" | MinedCache: {tot_recipe_cashed:,} solved of {look:,} "
+           f"looked up ({pct:.2f}%)")
+    if recipe_index.n_rejected:
+        out += f", {recipe_index.n_rejected:,} bad"
     return out
 
 
@@ -1481,10 +1487,10 @@ def main():
                     to_submit.discard(_I)
                     _cashed += 1
             tot_recipe_cashed += _cashed
-            if _cashed:
-                print(f"  [recipe] cashed {_cashed:,} targets from the index in "
-                      f"{time.time()-_t_rec:.1f}s -- {len(to_submit):,} still "
-                      f"need workers", flush=True)
+            print(f"  [mined-cache] looked up {len(_ordered[:_budget]):,} integrals, "
+                  f"solved {_cashed:,} without a job "
+                  f"({time.time()-_t_rec:.1f}s); {len(to_submit):,} still need workers",
+                  flush=True)
 
         # Limit concurrent jobs
         available_slots = args.max_concurrent - len(pending)

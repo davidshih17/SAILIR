@@ -70,6 +70,7 @@ class RecipeIndex:
                     f'{path}: keys are not in byte-lexicographic order '
                     f'({bad:,} inversions). Binary search would miss every '
                     f'lookup. Rebuild the index with the current merge.')
+        self.n_lookup = 0        # integrals ASKED about -- the denominator
         self.n_hit = 0
         self.n_verified = 0
         self.n_rejected = 0
@@ -97,6 +98,7 @@ class RecipeIndex:
         run. Every rejection path is counted so a silently-useless index shows up
         in the orchestrator's stats instead of just doing nothing.
         """
+        self.n_lookup += 1
         got = self.get(integral)
         if got is None:
             return None
@@ -130,8 +132,10 @@ class RecipeIndex:
         return rule
 
     def stats(self):
-        return (f"recipe-index: {len(self):,} entries, {self.n_hit:,} hits, "
-                f"{self.n_verified:,} verified, {self.n_rejected:,} rejected")
+        pct = (100.0 * self.n_verified / self.n_lookup) if self.n_lookup else 0.0
+        return (f"mined cache: {len(self):,} entries; {self.n_lookup:,} looked up, "
+                f"{self.n_hit:,} found, {self.n_verified:,} usable ({pct:.2f}%), "
+                f"{self.n_rejected:,} rejected")
 
 
 def load_if_configured():
