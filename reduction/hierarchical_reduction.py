@@ -208,6 +208,23 @@ def apply_substitutions(expr, cache, prime, progress=0):
 _ITER_CLOCK = {'n': None, 't': None}
 
 
+def _health_str(recipe_index, tot_recipe_cashed, tot_reclaimed):
+    """Always-on counters for the two mechanisms that are otherwise SILENT.
+
+    A mechanism that only logs when it does something is indistinguishable from
+    one that is not running at all -- the failure mode is a quiet zero that
+    reads as success. Reconciliation always shows its running total; the recipe
+    index shows hits/verified/rejected whenever it is loaded, so a 0% hit rate
+    is visible as 0% rather than as absence.
+    """
+    out = f" | Reclaimed: {tot_reclaimed}"
+    if recipe_index is not None:
+        out += (f" | Recipe: {tot_recipe_cashed} cashed"
+                f" ({recipe_index.n_hit} hit/{recipe_index.n_verified} ok"
+                f"/{recipe_index.n_rejected} rej)")
+    return out
+
+
 def _iter_tag(iteration):
     """[HH:MM:SS Iter N +Ns] and, on the FIRST print of a new iteration,
     "| Iter N-1 took Ds" -- the previous iteration's TRUE wall duration.
@@ -1151,6 +1168,8 @@ def main():
     expr = {starting_integral: 1}  # Current expression (linear combo of integrals)
     cache = {}  # integral -> reduced expression (memoization)
     pending = {}  # integral -> (cluster_id, output_file, submit_time, cpus)
+    tot_recipe_cashed = 0   # cumulative index hits turned into cache rules
+    tot_reclaimed = 0       # cumulative slots returned by reconciliation
     straggler_integrals = set()  # integrals that have been resubmitted as stragglers
     straggler2_integrals = set()  # integrals that have hit the second-level escalation
     if args.use_symmetry:
@@ -1425,6 +1444,7 @@ def main():
         if _RECONCILE_EVERY and iteration % _RECONCILE_EVERY == 0:
             _t_rec = time.time()
             _n_lost = reconcile_pending(pending, _RECONCILE_GRACE)
+            tot_reclaimed += _n_lost
             if _n_lost:
                 print(f"{_iter_tag(iteration)} [reconcile] reclaimed {_n_lost:,} "
                       f"slots from jobs that vanished without a result "
@@ -1460,6 +1480,7 @@ def main():
                     cache[_I] = _rule
                     to_submit.discard(_I)
                     _cashed += 1
+            tot_recipe_cashed += _cashed
             if _cashed:
                 print(f"  [recipe] cashed {_cashed:,} targets from the index in "
                       f"{time.time()-_t_rec:.1f}s -- {len(to_submit):,} still "
@@ -1930,12 +1951,14 @@ def main():
             print(f"{_iter_tag(iteration)} {masters_count} masters, {non_masters_count} non-masters | "
                   f"frontier=(L={frontier[0]},r={frontier[1]},s={frontier[2]}) x {n_at_frontier} | "
                   f"work={work} ({eta_str}) | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}"
+                  f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
             print(f"           [hist] {hist_str}")
             print(f"           [maxw] {maxw_str}")
         else:
             print(f"{_iter_tag(iteration)} {masters_count} masters, 0 non-masters | "
-                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}")
+                  f"Pending: {len(pending)} | Cache: {len(cache)} | Hits: {cache_hits}"
+                  f"{_health_str(recipe_index, tot_recipe_cashed, tot_reclaimed)}")
 
     # Final substitution
     expr = apply_substitutions(expr, cache, args.prime, progress=100_000)
