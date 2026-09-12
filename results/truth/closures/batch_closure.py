@@ -103,8 +103,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--group', required=True)
     ap.add_argument('--outdir', required=True)
-    ap.add_argument('--dr', type=int, default=1)
-    ap.add_argument('--ds', type=int, default=1)
+    # NOT --dr/--ds. The rectangle is the GROUP's (rmax, smax), computed by
+    # make_groups and stored in the group JSON. Accepting an independent dr/ds
+    # here let the two disagree silently: batch_worker_p101.sh never forwarded
+    # them, so every closure was built at target+1dot+1num regardless of what
+    # make_groups had decided, and the group's rmax/smax was printed and then
+    # ignored. Seeds scale as C(rmax, L) -- an unintended +1 dot is 5x the
+    # system (159,120 seeds instead of 31,824 for sector 15) -- so that silent
+    # divergence cost 5x on every build.
+    ap.add_argument('--allow-box-override', action='store_true',
+                    help='build a box LARGER than the group says (debug only); '
+                         'without it the group JSON is authoritative')
     ap.add_argument('--budget', type=int, default=500000)
     ap.add_argument('--cap-mb', type=int, default=9000,
                     help='abort above this RSS; keep under the per-CPU grant')
@@ -146,7 +155,19 @@ def main():
             continue
         t0 = time.time()
         try:
-            wr = eng.worker_replay(T, dr=args.dr, ds=args.ds, verbose=False)
+            # Derive the offsets from the GROUP's box for THIS target, so
+            # the system built is exactly the one make_groups sized and
+            # budgeted. dr/ds are per-target because the box is shared.
+            t_r = sum(x for x in T if x > 0)
+            t_s = sum(-x for x in T if x < 0)
+            dr = g['rmax'] - t_r
+            ds = g['smax'] - t_s
+            if dr < 0 or ds < 0:
+                raise AssertionError(
+                    f'group box r<={g["rmax"]} s<={g["smax"]} does not contain '
+                    f'target r={t_r} s={t_s} -- make_groups and this build '
+                    f'disagree about the system')
+            wr = eng.worker_replay(T, dr=dr, ds=ds, verbose=False)
             closure = [(op, tuple(x + d for x, d in zip(J, delta)))
                        for (J, op, delta) in wr['actions']]
             # PIVOTS, parallel to `closure`. worker_replay knows J but the

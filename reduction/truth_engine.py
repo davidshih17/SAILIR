@@ -76,8 +76,30 @@ class TruthEngine:
         if os.environ.get('SAILIR_SECTOR_RANK', '0') == '1':
             from canonical_masters import apply_canonical_masters
             apply_canonical_masters()
-        from symmetry_route import tkey
-        self.tkey = tkey
+        from symmetry_route import tkey as _tkey_raw
+
+        # MEMOIZED. tkey is a PURE function of the integral, so this returns
+        # bit-identical values and the loop structure is untouched.
+        #
+        # MEASURED on a 6,825-seed build: 35,674,555 calls but only 101,219
+        # DISTINCT integrals -- 99.7% of calls recompute a value already
+        # computed. Each rebuilds a 15-tuple of abs() plus two sums, which is
+        # why tkey was 66% of the runtime (249s of 380s under cProfile).
+        #
+        # MEMORY, which is the binding constraint here -- these builds die on
+        # the cap, not the clock: 101,219 entries x ~450 B is ~46 MB against
+        # builds that run at 6-12 GB. Bounded by the distinct integrals of one
+        # system and freed with the engine.
+        _tk_cache = {}
+
+        def _tkey_memo(i, _c=_tk_cache, _f=_tkey_raw):
+            v = _c.get(i)
+            if v is None:
+                v = _c[i] = _f(i)
+            return v
+
+        self._tk_cache = _tk_cache
+        self.tkey = _tkey_memo
         self.env = ibp_env.IBPEnvironment()
         self.n_actions = self.topo.n_actions
         self.systems = {}          # (sector, rmax, smax) -> rules

@@ -37,7 +37,7 @@ D=$B/results/truth/studies/$NAME
 
 [ -s "$TARGETS" ] || { echo "REFUSING: $TARGETS missing or empty" >&2; exit 1; }
 [ -e "$D" ] && { echo "REFUSING: $D exists (version the study name)" >&2; exit 1; }
-mkdir -p $D/{groups,closures,logs,shard}
+mkdir -p $D/{groups,closures,logs,shard,train}   # train/ is written by stage 3
 
 export SAILIR_TOPOLOGY=gravity3L SAILIR_SECTOR_RANK=1 PYTHONUNBUFFERED=1
 
