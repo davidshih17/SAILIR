@@ -62,8 +62,8 @@ def get_non_masters_in_sector(expr, target_sector):
 
 def load_model(checkpoint_path, device='cpu'):
     """Load the classifier model."""
-    model = IBPActionClassifier()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model = IBPActionClassifier(prime=checkpoint['args']['prime'])
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
