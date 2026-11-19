@@ -47,7 +47,7 @@ python scripts/eval/onestep_worker.py \
     --prime 1009 \
     --paper-masters-only -v
 
-python scripts/eval/replay_reduction_path.py --path reduction.pkl
+python scripts/eval/replay_reduction_path.py --path reduction.pkl --prime 1009
 ```
 
 ## End-to-end reproduction
